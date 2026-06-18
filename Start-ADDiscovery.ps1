@@ -5,7 +5,7 @@ if ($VerbosePreference -eq "Continue") {
 } else {
 	$global:VerbosePreference = "SilentlyContinue"
 }
-Import-Module ./Modules/fury.psm1 -Force
+Import-Module ./FuryPsm/fury.psm1 -Force
 
 $MainMenu = [ordered]@{
 	"Title" = "Main Menu"

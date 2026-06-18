@@ -1,0 +1,3 @@
+[submodule "FuryPsm"]
+	path = FuryPsm
+	url = https://github.com/aaronfury/FuryPsm

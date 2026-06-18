@@ -1,0 +1,26 @@
+{
+	"settings" : {
+		"ErrorThreshold" : 0, // If this is set to a positive integer, the script will terminate once this number of errors is logged using the Write-Log function
+		"EmailOnErrors" : false, // If set to true, the module will attempt to send the script's log file to the email address
+		"ErrorsEmailSmtpServer" : "", // Must allow open relay. Authenticated user support coming later.
+		"ErrorsEmailFromAddress" : "", // The "From:" address to stamp on the errors email
+		"ErrorsEmailRecipients" : "", // A comma-separated list of email addresses
+		"TranscriptionEnabled" : true, // If set to true, the fury PSM will start transcription early on.
+		"LogsEnabled" : true, // If set to false, no log file will be created and the Write-Log function will not output anything to a file. It will still write to the console.
+		"LogsInSubdirectory" : true, // If set to true, log files will be stored in a "Logs" subdirectory of the script's directory. If false, log files will be stored in the same directory as the script.
+		"OutputInSubdirectory" : true, // If set to true, output files will be stored in a "Output" subdirectory of the script's directory. If false, output files will be stored in the same directory as the script.
+		"RequiredModules" : [], // A list of module names that the script will check for and attempt to import at runtime. If any of the modules cannot be imported, the script will terminate with an error.
+		"UseAdminCredentials" : false, // If set to true, the script will attempt to load administrator credentials from the specified file and use them for any operations that require authentication. Those credentials can be referenced by adding @CredSplat to any cmdlet calls that support the -Credential parameter. If this setting is false, the script will not attempt to load any credentials and will run with the current user's context.
+		"AdminUsername" : "", // If UseAdminCredentials is true, this setting specifies the username to use for administrator credentials. If AdminCredentialPassFile is specified and contains a valid password, the script will attempt to create a PSCredential object using this username and the password from the file.
+		"AdminCredentialPassFile" : "", // If UseAdminCredentials is true, the script will attempt to read a "Secure String" password from this file. If this setting is blank, the script will prompt the user for credentials at launch.
+		"AdminIsPrivileged" : false, // Whether the provided "admin" account has privileges to connect to remote computers for enumeration. If set to false, the script will only pull data that can be accessed by a standard Domain User account.
+		"DryRun" : false // If set to true, any cmdlets that support the -WhatIf parameter will be run with that parameter, to prevent changes from being made to the system. Custom functions should check the $Settings["DryRun"] variable and use it to determine whether to make changes or not.
+		// You can specify any custom settings here. The module will automatically load them into the $Settings variable
+	},
+	"variables" : {
+		"SourceDomain" : "",
+		"AdditionalUserAttributes" : [],
+		"AdditionalGroupAttributes" : [],
+		"AdditionalComputerAttributes" : []
+	}
+}
