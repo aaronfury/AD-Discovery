@@ -19,8 +19,10 @@
 	},
 	"variables" : {
 		"SourceDomain" : "",
-		"AdditionalUserAttributes" : [],
+		"SkipForestDiscovery" : true, // When set to true, the discovery script will only run against the singular domain specified by the SourceDomain (or the domain that is detected on the account running the script)
+		"AdditionalUserAttributes" : [], // If you enable the "UseADSISearcher" switch and want to include additional attributes, you must populate these variables with the exact ADSI attribute name, not their ADWS/PowerShell aliases
 		"AdditionalGroupAttributes" : [],
-		"AdditionalComputerAttributes" : []
+		"AdditionalComputerAttributes" : [],
+		"UseADSISearcher" : true // For large environments (100K+ objects), defer to using the ADSI and DirectorySearcher classes directory rather than the ADWS interface used by PowerShell cmdlets. This is used for users, groups, and computer objects, and typically yields better performance.
 	}
 }

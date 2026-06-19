@@ -251,11 +251,16 @@ function Get-BasicInfo {
 		}
 	}
 
-	try {
-		Write-Log "Enumerating AD forest $($global:Variables["SourceDomain"])..."
-		$script:Forest = Get-AdForest # TODO: When run in the script, it complains that the Identity cannot be null; for some reason it's not auto-detecting the domain/forest of the workstation/user, or CredSplat is throwing it off.
-	} catch {
-		Write-Log "Unable to enumerate forest. The specific error is: $_" -Level ERROR -Fatal
+	if ($global:Variables["SkipForestDiscovery"]) {
+		Write-Log "SkipForestDiscovery is set to true. Performing all actions only against $($global:Variables["SourceDomain"])"
+		$script:Forest = [pscustomobject]@{Domains = $global:Variables["SourceDomain"]; RootDomain = $global:Variables["SourceDomain"]}
+	} else {
+		try {
+			Write-Log "Enumerating AD forest $($global:Variables["SourceDomain"])..."
+			$script:Forest = Get-AdForest -Server $global:Variables["SourceDomain"]
+		} catch {
+			Write-Log "Unable to enumerate forest. The specific error is: $_" -Level ERROR -Fatal
+		}
 	}
 
 	# Get Preferred Domain Controller for each domain
@@ -292,31 +297,35 @@ function Get-ForestDomainInfo {
 	Write-Title "Forest/Domain Discovery"
 
 	if ($Reports -contains "ForestAndDomains") {
-		Write-Log "Gathering forest information..."
-
 		try {
+			Write-Log "Enumerating domains..."
 			$AllDomains = $script:Forest.Domains | foreach { Get-AdDomain $_ @CredSplat }
-			Write-Log "- Found $($AllDomains.Count) domains in forest $($script:Forest.DnsRoot)."
-			Write-Log "- Found $($AllDomains.ReplicaDirectoryServers.Count) domain controllers in forest $($script:Forest.DnsRoot)."
 		} catch {
 			Write-Log " - Unable to enumerate domains. The specific error is: $_" -Level ERROR
 			return
 		}
 
-		# Forest Information - Functional Level, Alternative UPN suffixes, AD Sites and replication links, Global Catalogs, AD Recycle Bin, FRS/DFS-R Status
-		$script:ForestData = [ordered]@{
-			"Root Domain" = $script:Forest.RootDomain;
-			"Functional Level" = $script:Forest.ForestMode | Split-CamelCaseString;
-			"Child Domains" = $script:Forest.Domains.Count-1;
-			"Global Catalog Count" = $script:Forest.GlobalCatalogs.Count;
-			"FSMO - Schema Master" = $script:Forest.SchemaMaster;
-			"FSMO - Domain Naming Master" = $script:Forest.DomainNamingMaster;
-			"AD Site Count" = $script:Forest.Sites.Count;
-			"Schema Level" = $SchemaLevel;
-			"Alternative UPN Suffixes" = $script:Forest.UPNSuffixes -join ", "
-		}
+		if (-not $global:Variables["SkipForestDiscovery"]) {
+			Write-Log "Gathering forest information..."
 
-		$script:ForestData | Write-Data -OutputFile "Forest Summary - $global:ScriptExecutionTimestamp.csv"
+				Write-Log "- Found $(@($AllDomains).Count) domains in forest $($script:Forest.DnsRoot)."
+				Write-Log "- Found $($AllDomains.ReplicaDirectoryServers.Count) domain controllers in forest $($script:Forest.DnsRoot)."
+
+			# Forest Information - Functional Level, Alternative UPN suffixes, AD Sites and replication links, Global Catalogs, AD Recycle Bin, FRS/DFS-R Status
+			$script:ForestData = [ordered]@{
+				"Root Domain" = $script:Forest.RootDomain;
+				"Functional Level" = $script:Forest.ForestMode | Split-CamelCaseString;
+				"Child Domains" = $script:Forest.Domains.Count-1;
+				"Global Catalog Count" = $script:Forest.GlobalCatalogs.Count;
+				"FSMO - Schema Master" = $script:Forest.SchemaMaster;
+				"FSMO - Domain Naming Master" = $script:Forest.DomainNamingMaster;
+				"AD Site Count" = $script:Forest.Sites.Count;
+				"Schema Level" = $SchemaLevel;
+				"Alternative UPN Suffixes" = $script:Forest.UPNSuffixes -join ", "
+			}
+
+			$script:ForestData | Write-Data -OutputFile "Forest Summary - $($Forest.RootDomain) - $global:ScriptExecutionTimestamp.csv"
+		}
 
 		# Domain List - Collection of following for each domain: FQDNs, NETBIOS name, Parent Domain, Functional Level, FSMO role holders, number of domain controllers
 		$DomainData = @()
@@ -348,12 +357,12 @@ function Get-ForestDomainInfo {
 			$DomainData += ,$domainInfo
 		}
 
-		$DomainData | Write-Data -OutputFile "Domain Summary - $global:ScriptExecutionTimestamp.csv"
+		$DomainData | Write-Data -OutputFile "Domains Summary - $($Forest.RootDomain) - $global:ScriptExecutionTimestamp.csv"
 
 		Write-Log "Enumerating Organizational Units (OUs)..."
 		foreach ($domain in $AllDomains) {
 			$OUs = Get-ADOrganizationalUnit -Filter * -Properties CanonicalName,Description -Server $script:PreferredDCs[$domain.DNSRoot] @CredSplat
-			
+			Write-Log "- Read $($OUs.Count) OUs in $($domain.DNSRoot)"
 			$OUs | Select CanonicalName,Name,Description | Write-Data -OutputFile "OUs - $($domain.DNSroot) - $global:ScriptExecutionTimestamp.csv"
 		}
 
@@ -366,7 +375,7 @@ function Get-ForestDomainInfo {
 				foreach ($trust in $trusts) {
 					if ($trust.Target -notin $AllDomains.DNSRoot) {
 						try {
-							$target = Get-ADDomain $trust.Target @CredSplat -ErrorAction Stop
+							[void](Get-ADDomain $trust.Target @CredSplat -ErrorAction Stop)
 							$trust.TargetDomainUnreachable = $false
 						} catch {
 							$trust.TargetDomainUnreachable = $true
@@ -403,59 +412,65 @@ function Get-ForestDomainInfo {
 		}
 		$TrustData | Write-Data -OutputFile "Trust Summary - $global:ScriptExecutionTimestamp.csv"
 
-		# Schema Information - Whether any custom schema attributes exist (Compare against baselineschema.csv as a list of standard attributes to ignore)
-		Write-Log "Analyzing schema..."
-		try {
-			$SchemaPartition = $script:Forest.PartitionsContainer.Replace("CN=Partitions","CN=Schema")
-			$SchemaObjectVersion = (Get-ADObject -Server $script:Forest.RootDomain -Identity $SchemaPartition @CredSplat -Properties objectVersion).objectVersion
-		} catch {
-			Write-Log "Failed to retrieve schema information from $($script:Forest.RootDomain). The specific error is: $_" -Level ERROR
-		}
-
-		$SchemaLevels = @{
-			13 = "Windows 2000 Server";
-			30 = "Windows Server 2003";
-			31 = "Windows Server 2003 R2";
-			44 = "Windows Server 2008";
-			47 = "Windows Server 2008 R2";
-			51 = "Windows Server 8 Developers Preview";
-			52 = "Windows Server 8 Beta";
-			56 = "Windows Server 2012";
-			69 = "Windows Server 2012 R2";
-			87 = "Windows Server 2016";
-			88 = "Windows Server 2019/2022";
-		}
-		$SchemaLevel = $(if ($SchemaLevels[$SchemaObjectVersion]) { $SchemaLevels[$SchemaObjectVersion]} else { "Unknown version: $SchemaObjectVersion" })
-
-		Write-Log "- Comparing schema to baseline attributes"
-		try {
-			$SchemaAttributes = Get-ADObject -SearchBase (Get-ADRootDSE -Server $script:Forest.RootDomain).schemaNamingContext -LDAPFilter "(objectClass=attributeSchema)" -Properties Name,lDAPDisplayName,Created,Modified,attributeID,attributeSyntax @CredSplat -Server $script:Forest.RootDomain
-			Write-Log "- - Read $($SchemaAttributes.Count) attributes from the forest schema"
-
-			if (Test-Path .\baselineschema.csv) {
-				$BaselineAttributes = Import-Csv .\baselineschema.csv
-				Write-Log "- - Read $($BaselineAttributes.Count) records from baselineattributes.csv"
-				$SchemaAttributes = $SchemaAttributes | where {$_.attributeID -notin $BaselineAttributes.attributeID}
-				Write-Log "Removed baseline attributes from forest schema list, leaving $($SchemaAttributes.Count) attributes"
+		if (-not $global:Variables["SkipForestDiscovery"]) {
+			# Schema Information - Whether any custom schema attributes exist (Compare against baselineschema.csv as a list of standard attributes to ignore)
+			Write-Log "Analyzing schema..."
+			try {
+				$SchemaPartition = $script:Forest.PartitionsContainer.Replace("CN=Partitions","CN=Schema")
+				$SchemaObjectVersion = (Get-ADObject -Server $script:Forest.RootDomain -Identity $SchemaPartition @CredSplat -Properties objectVersion).objectVersion
+			} catch {
+				Write-Log "Failed to retrieve schema information from $($script:Forest.RootDomain). The specific error is: $_" -Level ERROR
 			}
-		} catch {
-			Write-Log "- Failed to enumerate schema attributes in $($script:Forest.RootDomain). The specific error is: $_" -Level ERROR
-		}
 
-		# Filter additional known attributes
-		$SchemaAttributes = $SchemaAttributes | where {$_.name -notlike "msExch*" -and $_.name -notlike "ms*"}
+			$SchemaLevels = @{
+				13 = "Windows 2000 Server";
+				30 = "Windows Server 2003";
+				31 = "Windows Server 2003 R2";
+				44 = "Windows Server 2008";
+				47 = "Windows Server 2008 R2";
+				51 = "Windows Server 8 Developers Preview";
+				52 = "Windows Server 8 Beta";
+				56 = "Windows Server 2012";
+				69 = "Windows Server 2012 R2";
+				87 = "Windows Server 2016";
+				88 = "Windows Server 2019/2022";
+			}
+			$SchemaLevel = $(if ($SchemaLevels[$SchemaObjectVersion]) { $SchemaLevels[$SchemaObjectVersion]} else { "Unknown version: $SchemaObjectVersion" })
 
-		if ($SchemaAttributes.Count) {
-			$SchemaData = $SchemaAttributes | Select Name,Created,Modified,@{n="Attribute ID"; e={$_.attributeID}}
-		} else {
-			$SchemaData = @{"Schema Discovery" = "No custom schema attributes detected"}
+			Write-Log "- Comparing schema to baseline attributes"
+			try {
+				$SchemaAttributes = Get-ADObject -SearchBase (Get-ADRootDSE -Server $script:Forest.RootDomain).schemaNamingContext -LDAPFilter "(objectClass=attributeSchema)" -Properties Name,lDAPDisplayName,Created,Modified,attributeID,attributeSyntax @CredSplat -Server $script:Forest.RootDomain
+				Write-Log "- - Read $($SchemaAttributes.Count) attributes from the forest schema"
+
+				if (Test-Path .\baselineschema.csv) {
+					$BaselineAttributes = Import-Csv .\baselineschema.csv
+					Write-Log "- - Read $($BaselineAttributes.Count) records from baselineattributes.csv"
+					$SchemaAttributes = $SchemaAttributes | where {$_.attributeID -notin $BaselineAttributes.attributeID}
+					Write-Log "Removed baseline attributes from forest schema list, leaving $($SchemaAttributes.Count) attributes"
+				}
+			} catch {
+				Write-Log "- Failed to enumerate schema attributes in $($script:Forest.RootDomain). The specific error is: $_" -Level ERROR
+			}
+
+			# Filter additional known attributes
+			$SchemaAttributes = $SchemaAttributes | where {$_.name -notlike "msExch*" -and $_.name -notlike "ms*"}
+
+			if ($SchemaAttributes.Count) {
+				$SchemaData = $SchemaAttributes | Select Name,Created,Modified,@{n="Attribute ID"; e={$_.attributeID}}
+			} else {
+				$SchemaData = @{"Schema Discovery" = "No custom schema attributes detected"}
+			}
+			$SchemaData | Write-Data -OutputFile "Schema Summary - $global:ScriptExecutionTimestamp.csv"
 		}
-		$SchemaData | Write-Data -OutputFile "Schema Summary - $global:ScriptExecutionTimestamp.csv"
 	}
 
 	if ($Reports -contains "DomainControllers") {
 		Write-Log "Analyzing domain controllers..."
-		$DCs = Get-AllDcs -ForestWide -DirectReturn -UseCachedData
+		if ($global:Variables["SkipForestDiscovery"]) {
+			$DCs = Get-AllDcs -Domains $global:Variables["SourceDomain"] -DirectReturn -UseCachedData
+		} else {
+			$DCs = Get-AllDcs -Domains $global:Variables["SourceDomain"] -ForestWide -DirectReturn -UseCachedData
+		}
 		
 		# Domain Controllers - include CPU, RAM, Storage, Uptime, OS, Patch Level, NIC-level DNS configuration, DNS Server conditional forwarding and zones
 		$DCData = @()
@@ -529,7 +544,7 @@ function Get-ForestDomainInfo {
 	if ($Reports -contains "ReplicationHealth") {
 		Write-Log "Analyzing Active Directory replication health..."
 
-		$DCs = Get-AllDcs -ForestWide -DirectReturn -UseCachedData
+		$DCs = Get-AllDcs -Domains $global:Variables["SourceDomain"] -ForestWide -DirectReturn -UseCachedData
 
 		$ReplData = @()
 		foreach ($dc in $DCs) {
@@ -720,22 +735,29 @@ function Get-UserGroupInfo {
 			"DisplayName",
 			"sAMAccountName",
 			"UserPrincipalName",
-			"EmailAddress",
-			"Created",
-			"Modified",
-			"LastLogonDate",
 			"Enabled",
 			"CanonicalName",
-			"AccountExpirationDate",
-			"PasswordExpired",
-			"PasswordLastSet",
-			"LockedOut",
 			"AdminCount",
 			"EmployeeID",
 			"EmployeeNumber",
 			"EmployeeType",
 			"Manager"
 		)
+		$AttribMap = @{ # ADSI attribute mapped to ADWSAttribute
+			"mail" = "EmailAddress";
+			"whenCreated" = "Created";
+			"whenChanged" = "Modified";
+			"lastLogonTimestamp" = "LastLogonDate";
+			"accountExpires" = "AccountExpirationDate";
+			"userAccountControl" = "PasswordNeverExpires"; # userAccountControl is also used to calculate whether the account is Enabled, but we can't map the same key to multiple values and we only need to retrieve it once anyway. So "Enabled" will still get passed to an ADSI search, but then it gets updated during the export of data to the CSV
+			"pwdLastSet" = "PasswordLastSet";
+			"msDS-User-Account-Control-Computed" = "LockedOut";
+		}
+		if ($Variables["UseADSISearcher"]) {
+			$UserAttributes += $AttribMap.Keys
+		} else {
+			$UserAttributes += $AttribMap.Values
+		}
 
 		if ($Variables["AdditionalUserAttributes"]) {
 			$UserAttributes += $Variables["AdditionalUserAttributes"]
@@ -743,14 +765,44 @@ function Get-UserGroupInfo {
 
 		foreach ($domain in $script:Forest.Domains) {
 			Write-Log "Enumerating AD user objects in $domain..."
-			try {
-				$Users = Get-ADUser -Filter * -Properties $UserAttributes -Server $script:PreferredDCs[$domain] @CredSplat -ErrorAction Stop | Select-Object @{n="Domain";e={$domain}},*
-			} catch {
-				Write-Log "Failed to enumerate user objects in $domain. The specific error is: $_" -Level ERROR
-				continue
+			if ( $global:Variables["UseADSISearcher"] ) {
+				$Users = Get-ADSIObject -ObjectType User -Properties $UserAttributes -Server $script:PreferredDCs[$domain]
+			} else {
+				try {
+					$Users = Get-ADUser -Filter * -ResultSetSize $null -Properties $UserAttributes -Server $script:PreferredDCs[$domain] @CredSplat -ErrorAction Stop
+				} catch {
+					Write-Log "Failed to enumerate user objects in $domain. The specific error is: $_" -Level ERROR
+					continue
+				}
 			}
 
-			$Users | Write-Data -OutputFile "User Accounts - $domain - $global:ScriptExecutionTimestamp.csv"
+			if ($Variables["UseADSISearcher"]) {
+				# userAccountControl and msDS-User-Account-Control-Computed are bit fields, so the flags we
+				# report are decoded here rather than renamed. Bits: 0x2 = ACCOUNTDISABLE (Enabled is its
+				# inverse), 0x10000 = DONT_EXPIRE_PASSWORD, 0x10 (computed) = LOCKOUT.
+				$AttribLabels = foreach ($attribute in $UserAttributes) {
+					switch ($attribute) {
+						"Enabled" {
+							@{n="Enabled";e={-not ([int]$_.userAccountControl -band 0x2)}}
+						}
+						"userAccountControl" {
+							@{n="PasswordNeverExpires";e={[bool]([int]$_.userAccountControl -band 0x10000)}}
+						}
+						"msDS-User-Account-Control-Computed" {
+							@{n="LockedOut";e={[bool]([int]$_.'msDS-User-Account-Control-Computed' -band 0x10)}}
+						}
+						default {
+							if ($AttribMap[$attribute]) {
+								@{n=$AttribMap[$attribute];e={$_.$attribute}.GetNewClosure()}
+							} else {
+								$attribute
+							}
+						}
+					}
+				}
+			}
+
+			$Users | Select $AttribLabels | Write-Data -OutputFile "User Accounts - $domain - $global:ScriptExecutionTimestamp.csv"
 
 			$UserSummary = [PSCustomObject]@{
 				"Domain Name" = $domain
@@ -759,25 +811,74 @@ function Get-UserGroupInfo {
 				"Disabled Accounts" = @($Users | Where-Object {-not $_.Enabled}).Count
 				"Password Expired" = @($Users | Where-Object { $_.PasswordExpired -eq $true }).Count
 				"Expired Account" = @($Users | Where-Object { $null -ne $_.AccountExpirationDate -and $_.AccountExpirationDate -lt (Get-Date)}).Count
- 		}
+	 		}
+
 			Write-Log $UserSummary -Silent
 			$UserSummary | Out-Host
 		}
 	}
 
 	if ($Reports -contains "Groups") {
+
+		# Attributes whose names are identical in ADSI and the ActiveDirectory (ADWS) module.
+		$GroupAttributes = @(
+			"Name",
+			"sAMAccountName",
+			"Description",
+			"ManagedBy",
+			"AdminCount"
+		)
+		$AttribMap = @{ # ADSI attribute mapped to ADWS attribute
+			"mail" = "EmailAddress";
+			"whenCreated" = "Created";
+			"whenChanged" = "Modified";
+		}
+		if ($Variables["UseADSISearcher"]) {
+			$GroupAttributes += $AttribMap.Keys
+			$GroupAttributes += "groupType" # bitfield decoded into GroupCategory + GroupScope below
+		} else {
+			$GroupAttributes += $AttribMap.Values
+			$GroupAttributes += "GroupCategory","GroupScope"
+		}
+
+		if ($Variables["AdditionalGroupAttributes"]) {
+			$GroupAttributes += $Variables["AdditionalGroupAttributes"]
+		}
+
 		foreach ($domain in $script:Forest.Domains) {
 			Write-Log "Enumerating AD group objects in $domain..."
-			try {
-				$Groups = Get-ADGroup -Filter * -Properties Description,ManagedBy,Created,Modified,AdminCount,member -Server $script:PreferredDCs[$domain] @CredSplat -ErrorAction Stop |
-					Select-Object @{n="Domain";e={$domain}},Name,sAMAccountName,GroupCategory,GroupScope,Description,ManagedBy,Created,Modified,AdminCount,@{n="Member Count";e={@($_.member).Count}}
-			} catch {
-				Write-Log "Failed to enumerate group objects in $domain. The specific error is: $_" -Level ERROR
-				continue
+			if ( $global:Variables["UseADSISearcher"] ) {
+				$Groups = Get-ADSIObject -ObjectType Group -Properties $GroupAttributes -Server $script:PreferredDCs[$domain]
+			} else {
+				try {
+					$Groups = Get-ADGroup -Filter * -Properties $GroupAttributes -Server $script:PreferredDCs[$domain] @CredSplat -ErrorAction Stop
+				} catch {
+					Write-Log "Failed to enumerate group objects in $domain. The specific error is: $_" -Level ERROR
+					continue
+				}
+			}
+			
+			# Map the ADSI attribute names back to friendly column names for uniformity with the ADWS
+			# path. groupType is a bitfield: 0x80000000 = security-enabled (else distribution);
+			# 0x2 = Global, 0x4 = DomainLocal, 0x8 = Universal scope.
+			$AttribLabels = foreach ($attribute in $GroupAttributes) {
+				switch ($attribute) {
+					"groupType" {
+						@{n="GroupCategory";e={if ([long]$_.groupType -band 0x80000000) {"Security"} else {"Distribution"}}}
+						@{n="GroupScope";e={$gt = [long]$_.groupType; if ($gt -band 0x2) {"Global"} elseif ($gt -band 0x4) {"DomainLocal"} elseif ($gt -band 0x8) {"Universal"} else {"Unknown"}}}
+					}
+					default {
+						if ($AttribMap[$attribute]) {
+							@{n=$AttribMap[$attribute];e={$_.$attribute}.GetNewClosure()}
+						} else {
+							$attribute
+						}
+					}
+				}
 			}
 
-			$Groups | Write-Data -OutputFile "Groups - $domain - $global:ScriptExecutionTimestamp.csv"
-			Write-Log "- Found $($Groups.Count) groups in $domain"
+			$Groups = $Groups | Select-Object $AttribLabels | Write-Data -OutputFile "Groups - $domain - $global:ScriptExecutionTimestamp.csv"
+			Write-Log "- Found $(@($Groups).Count) groups in $domain"
 		}
 	}
 
@@ -793,24 +894,33 @@ function Get-UserGroupInfo {
 				continue
 			}
 
-			$membershipMapping = [System.Collections.Generic.Dictionary[string, System.Collections.Generic.List[string]]]::new()
+			# Each member is returned as its own search result entry (not a multivalued attribute read),
+			# so this is paged by MaxPageSize and the AD cmdlets retrieve all of them - it is NOT subject
+			# to the 1500-value (MaxValRange) cap that limits reading a group's 'member' attribute directly.
+			$membershipMapping = [System.Collections.Generic.Dictionary[string, PSCustomObject]]::new()
 
 			foreach ($group in $Groups) {
 				$escapedGroupDN = $group.DistinguishedName -replace '(?=[()\\\*])', '\'
 
-				$ldapFilter = "(&(objectCategory=person)(objectClass=user)(memberOf:1.2.840.113556.1.4.1941:=$escapedGroupDN))"
+				# Transitive (LDAP_MATCHING_RULE_IN_CHAIN) membership, restricted to leaf principals:
+				# users (person + user, which excludes contacts) and computers (objectCategory=computer).
+				$ldapFilter = "(&(memberOf:1.2.840.113556.1.4.1941:=$escapedGroupDN)(|(&(objectCategory=person)(objectClass=user))(objectCategory=computer)))"
 
 				try {
-					$members = Get-ADUser -LDAPFilter $ldapFilter -Server $script:PreferredDCs[$domain]
+					$members = Get-ADObject -LDAPFilter $ldapFilter -Properties sAMAccountName -Server $script:PreferredDCs[$domain] @CredSplat
 
 					foreach ($member in $members) {
-						$userDN = $member.DistinguishedName
+						$memberDN = $member.DistinguishedName
 
-						if (-not $membershipMapping.ContainsKey($userDN)) {
-							$membershipMapping[$userDN] = [System.Collections.Generic.List[string]]::new()
+						if (-not $membershipMapping.ContainsKey($memberDN)) {
+							$membershipMapping[$memberDN] = [PSCustomObject]@{
+								SamAccountName = $member.sAMAccountName
+								Type           = $member.ObjectClass   # "user" or "computer"
+								Groups         = [System.Collections.Generic.List[string]]::new()
+							}
 						}
 
-						$membershipMapping[$userDN].Add($group.Name)
+						$membershipMapping[$memberDN].Groups.Add($group.Name)
 					}
 				} catch {
 					Write-Log "- Failed to enumerate group membership for $($group.Name). The specific error is: $_" -Level ERROR
@@ -819,18 +929,17 @@ function Get-UserGroupInfo {
 
 			$MembershipData = [System.Collections.Generic.List[PSCustomObject]]::new()
 
-			foreach  ($mapping in $membershipMapping.GetEnumerator()) {
-				$userSamAccountName = ($mapping.Key -split ',*..=')[1]
-
-				foreach ($group in $mapping.Value) {
+			foreach ($mapping in $membershipMapping.GetEnumerator()) {
+				foreach ($groupName in $mapping.Value.Groups) {
 					$MembershipData.Add([PSCustomObject]@{
-						"User SAMAccountName" =$userSamAccountName;
-						"Group" = $group;
+						"Member SAMAccountName" = $mapping.Value.SamAccountName;
+						"Member Type"           = $mapping.Value.Type;
+						"Group"                 = $groupName;
 					})
 				}
 			}
 
-			$MembershipData | Write-Data -OutputFile "Group Membership By User - $domain - $global:ScriptExecutionTimestamp.csv"
+			$MembershipData | Write-Data -OutputFile "Group Membership By Member - $domain - $global:ScriptExecutionTimestamp.csv"
 
 		}
 	}
@@ -858,24 +967,66 @@ function Get-ComputerServerInfo {
 
 	if ($Reports -contains 'All') { $Reports = @("Computers","Servers") }
 
-	$computerAttributes = @(
-		"Name","DNSHostName","CanonicalName","Created","Modified","Description","Enabled",
-		"LastLogonDate","OperatingSystem","OperatingSystemVersion","IPv4Address","PasswordLastSet"
+	# Attributes whose names are identical in ADSI and the ActiveDirectory (ADWS) module.
+	$ComputerAttributes = @(
+		"Name",
+		"DNSHostName",
+		"CanonicalName",
+		"Description",
+		"OperatingSystem",
+		"OperatingSystemVersion",
+		"Enabled"
 	)
+	$AttribMap = @{ # ADSI attribute mapped to ADWS attribute
+		"whenCreated" = "Created";
+		"whenChanged" = "Modified";
+		"lastLogonTimestamp" = "LastLogonDate";
+		"pwdLastSet" = "PasswordLastSet";
+		"userAccountControl" = "IPv4Address" # I know this is janky since it's not a real mapping, but it seems cleaner to do this than to add a unique value in each branch
+	}
+	if ($Variables["UseADSISearcher"]) {
+		$ComputerAttributes += $AttribMap.Keys
+	} else {
+		$ComputerAttributes += $AttribMap.Values
+	}
 
 	if ($Variables["AdditionalComputerAttributes"]) {
-		$computerAttributes += $Variables["AdditionalComputerAttributes"]
+		$ComputerAttributes += $Variables["AdditionalComputerAttributes"]
 	}
 
 	foreach ($domain in $script:Forest.Domains) {
 		Write-Log "Enumerating AD computer objects in $domain..."
-		try {
-			$Computers = Get-ADComputer -Filter * -Properties $computerAttributes -Server $script:PreferredDCs[$domain] @CredSplat -ErrorAction Stop |
-				Select-Object @{n="Domain";e={$domain}},*
-		} catch {
-			Write-Log "Failed to enumerate computer objects in $domain. The specific error is: $_" -Level ERROR
-			continue
+		if ( $global:Variables["UseADSISearcher"] ) {
+			$Computers = Get-ADSIObject -ObjectType Computer -Properties $ComputerAttributes -Server $script:PreferredDCs[$domain]
+		} else {
+			try {
+				$Computers = Get-ADComputer -Filter * -Properties $ComputerAttributes -Server $script:PreferredDCs[$domain] @CredSplat -ErrorAction Stop
+			} catch {
+				Write-Log "Failed to enumerate computer objects in $domain. The specific error is: $_" -Level ERROR
+				continue
+			}
 		}
+			
+		# Map the ADSI attribute names back to friendly column names for uniformity with the ADWS path.
+		# Enabled is the inverse of userAccountControl bit 0x2 (ACCOUNTDISABLE).
+		$AttribLabels = @(@{n="Domain";e={$domain}})
+		$AttribLabels += foreach ($attribute in $ComputerAttributes) {
+			switch ($attribute) {
+				"Enabled" {
+					@{n="Enabled";e={-not ([int]$_.userAccountControl -band 0x2)}}
+				}
+				"userAccountControl" { } # fetched only to power Enabled; not emitted as its own column
+				default {
+					if ($AttribMap[$attribute]) {
+						@{n=$AttribMap[$attribute];e={$_.$attribute}.GetNewClosure()}
+					} else {
+						$attribute
+					}
+				}
+			}
+		}
+
+		$Computers = $Computers | Select-Object $AttribLabels
 
 		# Partition the results: a "Server" runs a server OS; everything else is treated as a workstation/client.
 		$Servers = $Computers | Where-Object { $_.OperatingSystem -like "*Server*" }
@@ -909,5 +1060,6 @@ function Get-AllInfo {
 # ============ MAIN PROGRAM ==============
 
 Get-BasicInfo
-
+Write-Host "Loading main menu..."
+Start-Sleep -Seconds 5
 New-Menu $MainMenu
