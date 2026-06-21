@@ -791,6 +791,9 @@ function Get-UserGroupInfo {
 						"msDS-User-Account-Control-Computed" {
 							@{n="LockedOut";e={[bool]([int]$_.'msDS-User-Account-Control-Computed' -band 0x10)}}
 						}
+						"accountExpires" {
+							@{n="AccountExpirationDate";e={$_.accountExpires}}
+						}
 						default {
 							if ($AttribMap[$attribute]) {
 								@{n=$AttribMap[$attribute];e={$_.$attribute}.GetNewClosure()}
@@ -802,14 +805,14 @@ function Get-UserGroupInfo {
 				}
 			}
 
-			$Users | Select $AttribLabels | Write-Data -OutputFile "User Accounts - $domain - $global:ScriptExecutionTimestamp.csv"
+			$Users = $Users | Select-Object $AttribLabels
+			$Users | Write-Data -OutputFile "User Accounts - $domain - $global:ScriptExecutionTimestamp.csv"
 
 			$UserSummary = [PSCustomObject]@{
 				"Domain Name" = $domain
 				"Total User Count" = @($Users).Count
 				"Privileged Accounts (AdminCount)" = @($Users | Where-Object {$_.AdminCount}).Count
 				"Disabled Accounts" = @($Users | Where-Object {-not $_.Enabled}).Count
-				"Password Expired" = @($Users | Where-Object { $_.PasswordExpired -eq $true }).Count
 				"Expired Account" = @($Users | Where-Object { $null -ne $_.AccountExpirationDate -and $_.AccountExpirationDate -lt (Get-Date)}).Count
 	 		}
 
@@ -877,14 +880,45 @@ function Get-UserGroupInfo {
 				}
 			}
 
-			$Groups = $Groups | Select-Object $AttribLabels | Write-Data -OutputFile "Groups - $domain - $global:ScriptExecutionTimestamp.csv"
+			$Groups = $Groups | Select-Object $AttribLabels
+			$Groups | Write-Data -OutputFile "Groups - $domain - $global:ScriptExecutionTimestamp.csv"
 			Write-Log "- Found $(@($Groups).Count) groups in $domain"
 		}
 	}
 
 	if ($Reports -contains "GroupMemberships") {
+		# This is a long-running enumeration (one transitive search per group) that can be killed mid-run
+		# when a remote session times out, so it is made resumable: after a group's members are written we
+		# append its DN to a checkpoint file. The next run loads that checkpoint, skips the groups already
+		# recorded, and appends to the same output. The checkpoint exists only while a run is incomplete -
+		# it is deleted once every domain/group has been processed, so its presence signals an interrupted run.
+		$resumeFile = ".\Group Membership.resume"
+
+		# Completed group DNs from a prior interrupted run (case-insensitive); empty on a fresh run.
+		$completedGroups = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+		$resuming = $false
+
+		if (Test-Path $resumeFile) {
+			if (Get-Confirmation -Message "Unfinished Group Membership enumeration detected. Resume?" -DefaultToYes) {
+				$resuming = $true
+				Get-Content $resumeFile | Where-Object { $_ } | ForEach-Object { [void]$completedGroups.Add($_) }
+				Write-Log "Resuming group membership enumeration: $($completedGroups.Count) already-processed group(s) will be skipped."
+			} else {
+				Remove-Item $resumeFile -Force
+			}
+		}
+
 		foreach ($domain in $script:Forest.Domains) {
 			Write-Log "Enumerating AD group memberships in $domain..."
+
+			# Stable (non-timestamped) output name so that a resumed run appends to the same file.
+			$outputFile = "Group Membership By Member - $domain.csv"
+
+			# On a fresh run, clear any output left over from a previous *completed* run for this domain.
+			if (-not $resuming) {
+				$outputFullPath = $(if ($global:Settings["OutputInSubdirectory"]) { ".\OUTPUT\$outputFile" } else { $outputFile })
+				if (Test-Path $outputFullPath) { Remove-Item $outputFullPath -Force }
+			}
 
 			try {
 				$Groups = Get-ADGroup -Filter * -Properties Name -Server $script:PreferredDCs[$domain] @CredSplat -ErrorAction Stop
@@ -894,54 +928,50 @@ function Get-UserGroupInfo {
 				continue
 			}
 
-			# Each member is returned as its own search result entry (not a multivalued attribute read),
-			# so this is paged by MaxPageSize and the AD cmdlets retrieve all of them - it is NOT subject
-			# to the 1500-value (MaxValRange) cap that limits reading a group's 'member' attribute directly.
-			$membershipMapping = [System.Collections.Generic.Dictionary[string, PSCustomObject]]::new()
+			if ($completedGroups.Count) {
+				$Groups = $Groups | Where-Object {$_.DistinguishedName -notin $completedGroups}
+				Write-Log "- Revised list of remaining groups to $($Groups.Count)"
+			}
 
+			$processedGroups = 0
 			foreach ($group in $Groups) {
 				$escapedGroupDN = $group.DistinguishedName -replace '(?=[()\\\*])', '\'
 
-				# Transitive (LDAP_MATCHING_RULE_IN_CHAIN) membership, restricted to leaf principals:
-				# users (person + user, which excludes contacts) and computers (objectCategory=computer).
 				$ldapFilter = "(&(memberOf:1.2.840.113556.1.4.1941:=$escapedGroupDN)(|(&(objectCategory=person)(objectClass=user))(objectCategory=computer)))"
 
 				try {
 					$members = Get-ADObject -LDAPFilter $ldapFilter -Properties sAMAccountName -Server $script:PreferredDCs[$domain] @CredSplat
 
-					foreach ($member in $members) {
-						$memberDN = $member.DistinguishedName
-
-						if (-not $membershipMapping.ContainsKey($memberDN)) {
-							$membershipMapping[$memberDN] = [PSCustomObject]@{
-								SamAccountName = $member.sAMAccountName
-								Type           = $member.ObjectClass   # "user" or "computer"
-								Groups         = [System.Collections.Generic.List[string]]::new()
-							}
+					$MembershipData = foreach ($member in $members) {
+						[PSCustomObject]@{
+							"Member SAMAccountName" = $member.sAMAccountName
+							"Member Type" = $member.ObjectClass   # "user" or "computer"
+							"Group" = $group.Name
 						}
+					}
 
-						$membershipMapping[$memberDN].Groups.Add($group.Name)
+					if ($MembershipData) {
+						$MembershipData | Write-Data -OutputFile $outputFile
 					}
 				} catch {
 					Write-Log "- Failed to enumerate group membership for $($group.Name). The specific error is: $_" -Level ERROR
+					continue # leave this group out of the checkpoint so it is retried on the next run
+				}
+
+				Add-Content -Path $resumeFile -Value $group.DistinguishedName
+				[void]$completedGroups.Add($group.DistinguishedName)
+
+				$processedGroups++
+				if (($processedGroups % 100) -eq 0) {
+					Write-Host "Processed $processedGroups groups out of $($Groups.Count)..." -Fore Gray
 				}
 			}
-
-			$MembershipData = [System.Collections.Generic.List[PSCustomObject]]::new()
-
-			foreach ($mapping in $membershipMapping.GetEnumerator()) {
-				foreach ($groupName in $mapping.Value.Groups) {
-					$MembershipData.Add([PSCustomObject]@{
-						"Member SAMAccountName" = $mapping.Value.SamAccountName;
-						"Member Type"           = $mapping.Value.Type;
-						"Group"                 = $groupName;
-					})
-				}
-			}
-
-			$MembershipData | Write-Data -OutputFile "Group Membership By Member - $domain - $global:ScriptExecutionTimestamp.csv"
-
 		}
+
+		# Every domain and group processed: the run finished cleanly, so the checkpoint is no longer needed.
+		if (Test-Path $resumeFile) { Remove-Item $resumeFile -Force }
+		Move-Item $outputFullPath $($outputFullPath -replace ".csv", "- $global:ScriptExecutionTimestamp.csv")
+		Write-Log "Group membership enumeration complete."
 	}
 
 	if ($Reports -contains "NestedGroups") {
