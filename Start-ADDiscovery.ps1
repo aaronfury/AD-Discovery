@@ -720,6 +720,33 @@ function Get-ForestDomainInfo {
 	Start-ConfirmationTimer -Message "Forest/Domain discovery complete"
 }
 
+function Get-GroupAncestors {
+	# Returns the set of all transitive parent-group DNs for $GroupDN by walking the group -> direct-parent
+	# nesting graph in $ParentsByDN (each group's memberOf). Results are memoized in $Cache so the whole
+	# forest's nesting is resolved in roughly one pass; the in-progress marker guards against nesting cycles
+	# (which AD normally forbids, but we don't want to loop forever if one exists).
+	param(
+		[Parameter(Mandatory=$true)][string]$GroupDN,
+		[Parameter(Mandatory=$true)][hashtable]$ParentsByDN,
+		[Parameter(Mandatory=$true)][hashtable]$Cache
+	)
+
+	if ($Cache.ContainsKey($GroupDN)) { return $Cache[$GroupDN] }
+
+	$ancestors = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+	$Cache[$GroupDN] = $ancestors # seed before recursing so a cycle back into this DN terminates
+
+	foreach ($parent in $ParentsByDN[$GroupDN]) {
+		if (-not $parent) { continue }
+		[void]$ancestors.Add($parent)
+		foreach ($a in (Get-GroupAncestors -GroupDN $parent -ParentsByDN $ParentsByDN -Cache $Cache)) {
+			[void]$ancestors.Add($a)
+		}
+	}
+
+	return $ancestors
+}
+
 function Get-UserGroupInfo {
 	param(
 		[Parameter()][string[]]$Reports
@@ -727,7 +754,7 @@ function Get-UserGroupInfo {
 
 	Write-Title "User/Group Discovery"
 
-	if ($Reports -contains 'All') { $Reports = @("Users","Groups","GroupMemberships","NestedGroups") }
+	if ($Reports -contains 'All') { $Reports = @("Users","Groups","Contacts","GroupMemberships","NestedGroups") }
 
 	if ($Reports -contains "Users") {
 		$UserAttributes = @(
@@ -741,7 +768,9 @@ function Get-UserGroupInfo {
 			"EmployeeID",
 			"EmployeeNumber",
 			"EmployeeType",
-			"Manager"
+			"Manager",
+			"ObjectGUID",
+			"ms-DS-ConsistencyGuid"
 		)
 		$AttribMap = @{ # ADSI attribute mapped to ADWSAttribute
 			"mail" = "EmailAddress";
@@ -829,7 +858,9 @@ function Get-UserGroupInfo {
 			"sAMAccountName",
 			"Description",
 			"ManagedBy",
-			"AdminCount"
+			"AdminCount",
+			"DistinguishedName",
+			"ObjectGUID"
 		)
 		$AttribMap = @{ # ADSI attribute mapped to ADWS attribute
 			"mail" = "EmailAddress";
@@ -886,23 +917,53 @@ function Get-UserGroupInfo {
 		}
 	}
 
-	if ($Reports -contains "GroupMemberships") {
-		# This is a long-running enumeration (one transitive search per group) that can be killed mid-run
-		# when a remote session times out, so it is made resumable: after a group's members are written we
-		# append its DN to a checkpoint file. The next run loads that checkpoint, skips the groups already
-		# recorded, and appends to the same output. The checkpoint exists only while a run is incomplete -
-		# it is deleted once every domain/group has been processed, so its presence signals an interrupted run.
-		$resumeFile = ".\Group Membership.resume"
+	if ($Reports -contains "Contacts") {
+		foreach ($domain in $script:Forest.Domains) {
+			Write-Log "Enumerating AD group objects in $domain..."
 
-		# Completed group DNs from a prior interrupted run (case-insensitive); empty on a fresh run.
-		$completedGroups = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+			$ContactAttributes = @(
+				"distinguishedName",
+				"name",
+				"proxyAddresses",
+				"targetAddress"	,
+				"mail",
+				"whenCreated",
+				"whenChanged"
+			)
+
+			$Contacts = Get-ADSIObject -ObjectType Other -Properties $ContactAttributes -LdapFilter '(objectClass=contact)' -Server $script:PreferredDCs[$domain] @CredSplat
+
+			$Contacts = $Contacts | Select-Object Name, @{n="Email Address"; e= {$_.mail}}, @{n="Target Address"; e={$_.targetAddress -replace "SMTP:",""}},distinguishedName, @{n="Additional SMTP addresses";e={($_.ProxyAddresses | Where-Object {$_ -clike "smtp:*"}).Replace('smtp:','') -join ';'}}, @{n="Created";e={$_.whenCreated}}, @{n="Modified";e={$_.whenModified}}
+
+			$Contacts | Write-Data -OutputFile "Contacts - $domain - $global:ScriptExecutionTimestamp.csv"
+			Write-Log "- Found $(@($Contacts).Count) groups in $domain"
+		}
+	}
+
+	if ($Reports -contains "GroupMemberships") {
+		# Transitive membership without a per-group server search. We read the directory ONCE per domain
+		# (one paged sweep returning every user, computer and group) and resolve nesting in memory:
+		#   - each group yields a DN -> Name entry and its direct parent groups (group.memberOf), and
+		#   - each user/computer yields its direct groups (principal.memberOf).
+		# A member's effective groups = its direct groups + the transitive ancestors of those groups. Each
+		# emitted row is tagged Direct (a first-level membership) or Nested (gained only via group nesting).
+		#
+		# Resumability: the per-row write phase (potentially millions of rows) is checkpointed by member DN
+		# in batches. If a remote session times out, the next run re-runs the (cheap) sweep, rebuilds the
+		# nesting graph, then skips members already recorded and appends the rest. The checkpoint exists only
+		# while a run is incomplete - its presence signals an interrupted run.
+		$resumeFile = ".\Group Membership.resume"
+		$batchSize  = 1000
+
+		# Completed member DNs from a prior interrupted run (case-insensitive); empty on a fresh run.
+		$completedMembers = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
 		$resuming = $false
 
 		if (Test-Path $resumeFile) {
 			if (Get-Confirmation -Message "Unfinished Group Membership enumeration detected. Resume?" -DefaultToYes) {
 				$resuming = $true
-				Get-Content $resumeFile | Where-Object { $_ } | ForEach-Object { [void]$completedGroups.Add($_) }
-				Write-Log "Resuming group membership enumeration: $($completedGroups.Count) already-processed group(s) will be skipped."
+				Get-Content $resumeFile | Where-Object { $_ } | ForEach-Object { [void]$completedMembers.Add($_) }
+				Write-Log "Resuming group membership enumeration: $($completedMembers.Count) already-processed member(s) will be skipped."
 			} else {
 				Remove-Item $resumeFile -Force
 			}
@@ -911,66 +972,106 @@ function Get-UserGroupInfo {
 		foreach ($domain in $script:Forest.Domains) {
 			Write-Log "Enumerating AD group memberships in $domain..."
 
-			# Stable (non-timestamped) output name so that a resumed run appends to the same file.
+			# Stable (non-timestamped) output name while the run is in progress so a resumed run appends to
+			# the same file; it is renamed to the timestamped convention once the domain is fully processed.
 			$outputFile = "Group Membership By Member - $domain.csv"
+			$outputFullPath = $(if ($global:Settings["OutputInSubdirectory"]) { ".\OUTPUT\$outputFile" } else { $outputFile })
 
-			# On a fresh run, clear any output left over from a previous *completed* run for this domain.
-			if (-not $resuming) {
-				$outputFullPath = $(if ($global:Settings["OutputInSubdirectory"]) { ".\OUTPUT\$outputFile" } else { $outputFile })
-				if (Test-Path $outputFullPath) { Remove-Item $outputFullPath -Force }
-			}
+			# On a fresh run, clear any in-progress output left over from a previous run for this domain.
+			if (-not $resuming -and (Test-Path $outputFullPath)) { Remove-Item $outputFullPath -Force }
 
-			try {
-				$Groups = Get-ADGroup -Filter * -Properties Name -Server $script:PreferredDCs[$domain] @CredSplat -ErrorAction Stop
-				Write-Log "- Enumerated $(@($Groups).Count) groups in $domain."
-			} catch {
-				Write-Log "- Failed to enumerate groups in $domain. The specific error is: $_" -Level ERROR
+			# One paged sweep: every user/computer (leaf principals) and every group (for names + nesting).
+			$allObjects = Get-ADSIObject -ObjectType Other -Server $script:PreferredDCs[$domain] `
+				-LdapFilter "(|(&(objectCategory=person)(objectClass=user))(objectCategory=computer)(objectCategory=group))" `
+				-Properties distinguishedName,sAMAccountName,name,objectClass,memberOf
+
+			if (-not $allObjects) {
+				Write-Log "- No objects returned for $domain." -Level WARNING
 				continue
 			}
 
-			if ($completedGroups.Count) {
-				$Groups = $Groups | Where-Object {$_.DistinguishedName -notin $completedGroups}
-				Write-Log "- Revised list of remaining groups to $($Groups.Count)"
-			}
-
-			$processedGroups = 0
-			foreach ($group in $Groups) {
-				$escapedGroupDN = $group.DistinguishedName -replace '(?=[()\\\*])', '\'
-
-				$ldapFilter = "(&(memberOf:1.2.840.113556.1.4.1941:=$escapedGroupDN)(|(&(objectCategory=person)(objectClass=user))(objectCategory=computer)))"
-
-				try {
-					$members = Get-ADObject -LDAPFilter $ldapFilter -Properties sAMAccountName -Server $script:PreferredDCs[$domain] @CredSplat
-
-					$MembershipData = foreach ($member in $members) {
-						[PSCustomObject]@{
-							"Member SAMAccountName" = $member.sAMAccountName
-							"Member Type" = $member.ObjectClass   # "user" or "computer"
-							"Group" = $group.Name
-						}
-					}
-
-					if ($MembershipData) {
-						$MembershipData | Write-Data -OutputFile $outputFile
-					}
-				} catch {
-					Write-Log "- Failed to enumerate group membership for $($group.Name). The specific error is: $_" -Level ERROR
-					continue # leave this group out of the checkpoint so it is retried on the next run
-				}
-
-				Add-Content -Path $resumeFile -Value $group.DistinguishedName
-				[void]$completedGroups.Add($group.DistinguishedName)
-
-				$processedGroups++
-				if (($processedGroups % 100) -eq 0) {
-					Write-Host "Processed $processedGroups groups out of $($Groups.Count)..." -Fore Gray
+			# Build the group Name map and the group -> direct-parent nesting graph. DirectorySearcher returns
+			# objectClass as the full class chain, so the structural type is derived by precedence.
+			$groupNameByDN = @{}
+			$parentsByDN = @{}
+			foreach ($obj in $allObjects) {
+				if (@($obj.objectClass) -contains "group") {
+					$groupNameByDN[$obj.distinguishedName] = $obj.name
+					$parentsByDN[$obj.distinguishedName] = $obj.memberOf
 				}
 			}
+			Write-Log "- Read $($groupNameByDN.Count) groups for nesting resolution."
+
+			# Precompute each group's transitive ancestors once; per-member work is then just set unions.
+			$ancestorCache = @{}
+			foreach ($groupDN in $groupNameByDN.Keys) {
+				[void](Get-GroupAncestors -GroupDN $groupDN -ParentsByDN $parentsByDN -Cache $ancestorCache)
+			}
+
+			$buffer = [System.Collections.Generic.List[PSCustomObject]]::new()
+			$batchDNs = [System.Collections.Generic.List[string]]::new()
+			$processed = 0
+
+			foreach ($obj in $allObjects) {
+				$classes = @($obj.objectClass)
+				if ($classes -contains "group") { continue } # leaves (users/computers) only
+				if ($completedMembers.Contains($obj.distinguishedName)) { continue } # already done in a prior run
+
+				$memberType = $(if ($classes -contains "computer") { "computer" } else { "user" })
+
+				# Direct groups, then expand to effective groups via each direct group's cached ancestors.
+				$directGroups = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+				foreach ($g in $obj.memberOf) { if ($g) { [void]$directGroups.Add($g) } }
+
+				$effectiveGroups = [System.Collections.Generic.HashSet[string]]::new($directGroups, [System.StringComparer]::OrdinalIgnoreCase)
+				foreach ($g in $directGroups) {
+					if ($ancestorCache.ContainsKey($g)) {
+						foreach ($a in $ancestorCache[$g]) { [void]$effectiveGroups.Add($a) }
+					}
+				}
+
+				foreach ($g in $effectiveGroups) {
+					# Resolve the group name; out-of-scope (e.g. cross-domain) groups fall back to the DN's CN.
+					$groupName = $(if ($groupNameByDN.ContainsKey($g)) { $groupNameByDN[$g] } else { ($g -split ',')[0] -replace '^CN=','' })
+					$buffer.Add([PSCustomObject]@{
+						"Member SAMAccountName" = $obj.sAMAccountName
+						"Member Type" = $memberType
+						"Group" = $groupName
+						"Membership" = $(if ($directGroups.Contains($g)) { "Direct" } else { "Nested" })
+					})
+				}
+
+				$batchDNs.Add($obj.distinguishedName)
+				$processed++
+
+				# Flush the batch: write rows FIRST, then checkpoint, so a crash only risks re-writing this
+				# batch (de-dupable) rather than losing it.
+				if ($batchDNs.Count -ge $batchSize) {
+					if ($buffer.Count) { $buffer | Write-Data -OutputFile $outputFile }
+					Add-Content -Path $resumeFile -Value $batchDNs
+					foreach ($d in $batchDNs) { [void]$completedMembers.Add($d) }
+					$buffer.Clear(); $batchDNs.Clear()
+					Write-Host "Processed $processed members in $domain..." -Fore Gray
+				}
+			}
+
+			# Flush the final partial batch.
+			if ($batchDNs.Count) {
+				if ($buffer.Count) { $buffer | Write-Data -OutputFile $outputFile }
+				Add-Content -Path $resumeFile -Value $batchDNs
+				foreach ($d in $batchDNs) { [void]$completedMembers.Add($d) }
+				$buffer.Clear(); $batchDNs.Clear()
+			}
+
+			# Finalize this domain's output to the timestamped convention (only if it was written this run).
+			if (Test-Path $outputFullPath) {
+				Move-Item $outputFullPath ($outputFullPath -replace '\.csv$', " - $global:ScriptExecutionTimestamp.csv") -Force
+			}
+			Write-Log "- Completed group membership enumeration for $domain ($processed members)."
 		}
 
-		# Every domain and group processed: the run finished cleanly, so the checkpoint is no longer needed.
+		# Every domain processed: the run finished cleanly, so the checkpoint is no longer needed.
 		if (Test-Path $resumeFile) { Remove-Item $resumeFile -Force }
-		Move-Item $outputFullPath $($outputFullPath -replace ".csv", "- $global:ScriptExecutionTimestamp.csv")
 		Write-Log "Group membership enumeration complete."
 	}
 
@@ -978,7 +1079,7 @@ function Get-UserGroupInfo {
 		Write-Log "Enumerating Nested Groups"
 
 		foreach ($domain in $script:Forest.Domains) {
-			$nestedGroups = Get-ADGroup -Filter {$MemberOf -like "*"} -Properties MemberOf @CredSplat -Server $script:PreferredDCs[$domain]
+			$nestedGroups = Get-ADGroup -Filter {MemberOf -like "*"} -Properties MemberOf @CredSplat -Server $script:PreferredDCs[$domain]
 			Write-Log "Found $(@($nestedGroups).Count) nested groups in $domain"
 
 			$nestedGroups | Select Name,DistinguishedName, GroupScope, GroupCategory, @{n="Member Of";e={$_.MemberOf -join "; "}} | Write-Data -Outputfile "Nested Groups - $domain - $global:ScriptExecutionTimestamp.csv"
