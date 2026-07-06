@@ -13,6 +13,7 @@ $MainMenu = [ordered]@{
 		"Forest/Domain Reports" = { New-Menu $DomainReportsMenu }
 		"User/Group Reports" = { New-Menu $UserGroupReportsMenu }
 		"Computer/Server Reports" = { New-Menu $ComputerServerReportsMenu }
+		"Inventory file shares (excluded from All Reports)" = { Get-FileShareInventory }
 		"Run All Reports" = { Get-AllInfo }
 	}
 }
@@ -21,11 +22,11 @@ $DomainReportsMenu = [ordered]@{
 	"Title" = "Forest/Domain Reports"
 	"Options" = [ordered]@{
 		"Run all reports" = { Get-ForestDomainInfo -Reports All}
-		"Forest and Domain Information" = { Get-ForestDomainInfo -Reports ForestAndDomains }
-		"Domain Controllers" = { Get-ForestDomainInfo -Reports DomainControllers }
-		"Group Policy Objects" = { Get-ForestDomainInfo -Reports GPOs }
-		"Replication Health" = { Get-ForestDomainInfo -Reports ReplicationHealth }
-		"AD Sites and Replication Links" = { Get-ForestDomainInfo -Reports Sites }
+		"Forest and domain information" = { Get-ForestDomainInfo -Reports ForestAndDomains }
+		"Domain controllers" = { Get-ForestDomainInfo -Reports DomainControllers }
+		"Group policy objects" = { Get-ForestDomainInfo -Reports GPOs }
+		"Replication health" = { Get-ForestDomainInfo -Reports ReplicationHealth }
+		"AD sites and replication links" = { Get-ForestDomainInfo -Reports Sites }
 	}
 }
 
@@ -33,10 +34,10 @@ $UserGroupReportsMenu = [ordered]@{
 	"Title" = "User/Group Reports"
 	"Options" = [ordered]@{
 		"Run all reports" = { Get-UserGroupInfo -Reports All }
-		"Get All User objects" = { Get-UserGroupInfo -Reports Users }
-		"Get All Group objects" = { Get-UserGroupInfo -Reports Groups }
-		"Get All Group Memberships" = { Get-UserGroupInfo -Reports GroupMemberships }
-		"Get All Nested Groups" = { Get-UserGroupInfo -Reports NestedGroups }
+		"Get all user objects" = { Get-UserGroupInfo -Reports Users }
+		"Get all group objects" = { Get-UserGroupInfo -Reports Groups }
+		"Get all group memberships" = { Get-UserGroupInfo -Reports GroupMemberships }
+		"Get all nested groups" = { Get-UserGroupInfo -Reports NestedGroups }
 	}
 }
 
@@ -44,10 +45,20 @@ $ComputerServerReportsMenu = [ordered]@{
 	"Title" = "Computer/Server Reports"
 	"Options" = [ordered]@{
 		"Run all reports" = { Get-ComputerServerInfo -Reports All }
-		"Get All Computer objects" = { Get-ComputerServerInfo -Reports Computers }
-		"Get All Server objects" = { Get-ComputerServerInfo -Reports Servers }
+		"Get all computer objects" = { Get-ComputerServerInfo -Reports Computers }
+		"Get all server objects" = { Get-ComputerServerInfo -Reports Servers }
+		"Inventory servers (excluded from All Reports)" = { Get-ServerInventory }
 	}
 }
+
+<#
+	SCRIPT CONSTANTS
+#>
+$appInstallRegPaths = @(
+	"HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*",
+	"HKLM:\Software\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*",
+	"HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*"
+)
 
 function Write-Title {
 	Param(
@@ -132,7 +143,7 @@ function Test-AdminPrivilege {
 		}
 
 		Write-Log "Testing admin privileges for $samAccount"
-		$adUser = Get-ADUser -Identity $samAccount | Get-ADUser -Identity $_.DistinguishedName -Properties "tokenGroups","memberOf" @CredSplat @eaSplat
+		$adUser = Get-ADUser -Identity $samAccount | Get-ADUser -Properties "tokenGroups","memberOf" @CredSplat @eaSplat
 
 		# tokenGroups expands all (including nested) group memberships present in the user's token.
 		foreach ($sid in @($adUser.tokenGroups | ForEach-Object { $_.Value })) {
@@ -159,43 +170,91 @@ function Get-RemoteSystemInfo {
 		so callers can merge it into a record unconditionally.
 	#>
 	param(
-		[Parameter(Mandatory=$true)][string]$ComputerName
+		[Parameter(Mandatory=$true)][string[]]$ComputerName
 	)
 
-	$info = [ordered]@{
-		"CPU Cores" = $null
-		"Total RAM (GB)" = $null
-		"Total Storage (GB)" = $null
-		"Free Storage (GB)" = $null
-		"Last Boot" = $null
-		"Uptime (Days)" = $null
-	}
+	$sessionOptions = New-PSSessionOption -CancelTimeout 60000 -OpenTimeout 60000 -OperationTimeout 600000 -IdleTimeout 60000
 
-	$session = $null
-	try {
-		$sessionParams = @{ ComputerName = $ComputerName; ErrorAction = "Stop" }
-		if ($global:CredSplat -and $global:CredSplat["Credential"]) {
-			$sessionParams["Credential"] = $global:CredSplat["Credential"]
+	$BatchResults = Invoke-Command -ComputerName $ComputerName @global:CredSplat -SessionOption $sessionOptions -ErrorVariable InvokeFailures -ScriptBlock {
+		$info = [ordered]@{
+			"Computer" = $env:ComputerName
+			"IPv4 Address" = $null
+			"AD Site" = $null
+			"CPU Cores" = $null
+			"Total RAM (GB)" = $null
+			"Total Storage (GB)" = $null
+			"Free Storage (GB)" = $null
+			"Last Boot" = $null
+			"Uptime (Days)" = $null
+			"Largest 5 apps" = $null
+			"Root Folders" = $null
+			"Program Files Folders" = $null
+			"Installed Roles" = $null
+			"Error" = ""
 		}
-		$session = New-CimSession @sessionParams
 
-		$os = Get-CimInstance -CimSession $session -ClassName Win32_OperatingSystem -ErrorAction Stop
-		$cs = Get-CimInstance -CimSession $session -ClassName Win32_ComputerSystem -ErrorAction Stop
-		$disks = Get-CimInstance -CimSession $session -ClassName Win32_LogicalDisk -Filter "DriveType=3" -ErrorAction Stop
+		try {
+			$os = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop
+			$cs = Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop
+			$disks = Get-CimInstance -ClassName Win32_LogicalDisk -Filter "DriveType=3" -ErrorAction Stop
+			$nic = Get-CimInstance -ClassName Win32_NetworkAdapterConfiguration -Filter "IPEnabled = True" -ErrorAction Stop
+			$info["IPv4 Address"] = ($nic | Select-Object -ExpandProperty IPAddress | Where-Object { $_ -match '\d+\.\d+\.\d+\.\d+' } | Select-Object -First 1)
+			$info["AD Site"] = (Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\Netlogon\Parameters" -Name "DynamicSiteName" | Select-Object -ExpandProperty DynamicSiteName)
+			$info["CPU Cores"] = $cs.NumberOfLogicalProcessors
+			$info["Total RAM (GB)"] = [math]::Round($cs.TotalPhysicalMemory / 1GB, 1)
+			$info["Total Storage (GB)"] = [math]::Round((($disks | Measure-Object -Property Size -Sum).Sum) / 1GB, 1)
+			$info["Free Storage (GB)"] = [math]::Round((($disks | Measure-Object -Property FreeSpace -Sum).Sum) / 1GB, 1)
+			$info["Last Boot"] = $os.LastBootUpTime
+			$info["Uptime (Days)"] = [math]::Round(((Get-Date) - $os.LastBootUpTime).TotalDays, 1)
+		} catch {
+			$info["Error"] += "Basic info: $_;"
+			return [pscustomobject]$info
+		}
+	
+		try {
+			$apps = @()
+			foreach ($path in $using:appInstallRegPaths) {
+				$apps += Get-ItemProperty -Path $path -ErrorAction SilentlyContinue
+			}
+			$apps = $apps | Where-Object { $_.DisplayName } | Select-Object DisplayName, @{Name="EstimatedSizeMB";Expression={[math]::Round($_.EstimatedSize/1MB,2)}} | Sort-Object -Property EstimatedSizeMB -Descending | Select-Object -First 5
+			$info["Largest 5 apps"] = ($apps | ForEach-Object { "$($_.DisplayName) [$($_.EstimatedSizeMB) MB]" }) -join ", "
+		} catch {
+			$info["Error"] += "App inventory: $_;"
+		}
 
-		$info["CPU Cores"] = $cs.NumberOfLogicalProcessors
-		$info["Total RAM (GB)"] = [math]::Round($cs.TotalPhysicalMemory / 1GB, 1)
-		$info["Total Storage (GB)"] = [math]::Round((($disks | Measure-Object -Property Size -Sum).Sum) / 1GB, 1)
-		$info["Free Storage (GB)"] = [math]::Round((($disks | Measure-Object -Property FreeSpace -Sum).Sum) / 1GB, 1)
-		$info["Last Boot"] = $os.LastBootUpTime
-		$info["Uptime (Days)"] = [math]::Round(((Get-Date) - $os.LastBootUpTime).TotalDays, 1)
-	} catch {
-		Write-Log "Failed to collect remote system information from $ComputerName via CIM/WMI. The specific error is: $_" -Level WARNING
-	} finally {
-		if ($session) { Remove-CimSession -CimSession $session -ErrorAction SilentlyContinue }
+		try {
+			$rootFolders = Get-ChildItem C:\ -Directory | Where-Object {$_.Name -notlike "Windows*"}
+			$programFileFolders = Get-ChildItem $env:ProgramFiles,${env:ProgramFiles(x86)} -Directory -ErrorAction SilentlyContinue
+			$info["Root Folders"] = $rootFolders.Name -join ", "
+			$info["Program Files Folders"] = $programFileFolders.Name -join ", "
+		} catch {
+			$info["Error"] += "Folder enumeration: $_;"
+		}
+		
+		try {
+			$roles = (Get-WindowsFeature | Where-Object {$_.Installed}).Name | Where-Object { $_ -notmatch "^NET*|^RSAT*|^PowerShell*|FileAndStorage-Services|File-Services|Wow64-Support|System-DataArchiver"}
+			$info["Installed Roles"] = $roles -join ", "
+		} catch {
+			$info["Error"] += "Roles: $_;"
+		}
+
+		return [pscustomobject]$info
 	}
 
-	return $info
+	# Synthesize a row for every server Invoke-Command could not reach (connection/auth/timeout), so each
+	# server in the batch yields exactly one row. ErrorDetails.Message is usually $null for remoting
+	# failures, so read the message from the Exception.
+	$failureRecords = foreach ($failure in $InvokeFailures) {
+		$msg = $(if ($failure.Exception -and $failure.Exception.Message) { $failure.Exception.Message } else { "$failure" })
+		if ($msg.Length -gt 250) { $msg = $msg.Substring(0, 250) + "..." }
+		[pscustomobject]@{ "Computer" = $failure.TargetObject; "Error" = $msg }
+	}
+
+	# Project every row (remote successes + synthesized failures) onto the same column set. Missing
+	# properties become $null, which keeps the CSV columns aligned regardless of which row is written first.
+	$columns = @("Computer","IPv4 Address","AD Site","CPU Cores","Total RAM (GB)","Total Storage (GB)","Free Storage (GB)","Last Boot","Uptime (Days)","Largest 5 apps","Root Folders","Program Files Folders","Installed Roles","Error")
+
+	return @($BatchResults) + @($failureRecords) | Select-Object $columns
 }
 
 function Get-GPOLinks {
@@ -205,22 +264,24 @@ function Get-GPOLinks {
 		Returns an empty array if the GPO is not linked anywhere.
 	#>
 	param(
-		[Parameter(Mandatory=$true)][guid]$Guid,
-		[Parameter(Mandatory=$true)][string]$Domain,
-		[string]$Server
+		[guid]$Guid,
+		[string]$Domain,
+		[string]$Server,
+		[xml]$Report   # optional pre-fetched report; avoids a second Get-GPOReport call when the caller already has it
 	)
 
 	$links = @()
 	try {
-		$reportParams = @{ Guid = $Guid; ReportType = "Xml"; Domain = $Domain; ErrorAction = "Stop" }
-		if ($Server) { $reportParams["Server"] = $Server }
-
-		[xml]$report = Get-GPOReport @reportParams
+		if (-not $Report) {
+			$reportParams = @{ Guid = $Guid; ReportType = "Xml"; Domain = $Domain; ErrorAction = "Stop" }
+			if ($Server) { $reportParams["Server"] = $Server }
+			[xml]$Report = Get-GPOReport @reportParams
+		}
 
 		# A GPO's <LinksTo> nodes each describe one container the policy is linked to. SOMPath is the
 		# linked container (e.g. "contoso.com/Sales/Workstations"), Enabled reflects whether the link is
 		# active, and NoOverride indicates the link is enforced.
-		foreach ($link in $report.GPO.LinksTo) {
+		foreach ($link in $Report.GPO.LinksTo) {
 			if (-not $link.SOMPath) { continue }
 			$state = $(if ($link.Enabled -eq "true") { "Enabled" } else { "Disabled" })
 			if ($link.NoOverride -eq "true") { $state += ", Enforced" }
@@ -232,6 +293,167 @@ function Get-GPOLinks {
 	}
 
 	return $links
+}
+
+function Get-FolderSize {
+	param(
+		[string]$Path
+	)
+
+	$log = robocopy $Path "C:\Windows\Temp\__rc_null__" /L /E /BYTES /NJH /NC /NDL /NFL /XX 2>$null
+	$summaryLine = $log | Select-String -Pattern '^\s*Bytes\s*:' 
+	if ($summaryLine) {
+		$bytes = ($summaryLine -split '\s+')[3]
+		return [math]::Round(([int64]$bytes / 1MB), 2)
+	}
+	return $null
+}
+
+function Get-PermissionsSummary {
+	param(
+		[string]$Path
+	)
+
+	try {
+		$acl = Get-Acl -Path $Path
+		($acl.Access | ForEach-Object {
+			"$($_.IdentityReference):$($_.AccessControlType)/$($_.FileSystemRights)"
+		}) -join "; "
+	} catch {
+		"Unable to read ACL. The specific error is: $_"
+	}
+}
+
+function Get-TraversedFolders {
+	param(
+		[string]$Path,
+		[int]$Depth,
+		[int]$MaxTraversalDepth,
+		[string]$RelativeName,
+		[string]$ShareName,
+		[string]$ResumeFile
+	)
+ 
+	$results = [System.Collections.Generic.List[psobject]]::new()
+	if ($Depth -gt $MaxTraversalDepth) { return $null }
+ 
+	$children = Get-ChildItem -Path $Path -Directory -ErrorAction SilentlyContinue
+	foreach ($child in $children) {
+		if ($Script:TraversedFolders.Contains($child.FullName)) { continue }
+		$rel = "$RelativeName/$($child.Name)"
+		$sizeMB = Get-FolderSize -Path $child.FullName
+		$perms  = Get-PermissionsSummary -Path $child.FullName
+ 
+		$results.Add([PSCustomObject]@{
+			Share = $ShareName
+			Path = $rel
+			Level = $Depth
+			FullPath = $child.FullName
+			SizeMB = $sizeMB
+			Permissions = $perms
+		})
+
+		if ($ResumeFile) { Add-Content -Path $ResumeFile -Value $child.FullName }
+		[void]($Script:TraversedFolders.Add($child.FullName))
+ 
+		if ($Depth -lt $MaxTraversalDepth) {
+			$childResults = Get-TraversedFolders -Path $child.FullName -Depth ($Depth + 1) -MaxTraversalDepth $MaxTraversalDepth -RelativeName $rel -ShareName $ShareName -ResumeFile $ResumeFile
+			if ($childResults -and $childResults.Count -gt 0) {
+				$results.AddRange([psobject[]]$childResults)
+			}
+		}
+	}
+	return $results
+}
+
+function ConvertFrom-GPOReportXml {
+	<#
+		Flattens a Get-GPOReport -ReportType Xml document into one normalized row per configured setting,
+		so GPO contents can be reviewed/pivoted in a spreadsheet instead of read as raw XML/HTML. Columns:
+		Domain, GPO, Scope (Computer/User), Extension (CSE), Category, Setting, State, Value.
+
+		Administrative Template (registry-backed) <Policy> settings are itemized precisely. Other client-side
+		extensions (Security, Preferences, Scripts, etc.) are flattened generically - one row per setting node
+		with whatever name/value text is extractable - and any extension that yields nothing still produces a
+		single "(configured)" presence row so it is never silently omitted. GPO XML is namespaced and
+		heterogeneous, so all navigation uses local-name() XPath to stay namespace-agnostic.
+	#>
+	param(
+		[Parameter(Mandatory=$true)][xml]$Report,
+		[Parameter(Mandatory=$true)][string]$Domain,
+		[Parameter(Mandatory=$true)][string]$GPOName
+	)
+
+	# First child element (any namespace) with the given local name; returns its trimmed text or $null.
+	$childText = {
+		param($node, $localName)
+		$hit = $node.SelectSingleNode("*[local-name()='$localName']")
+		if ($hit) { $hit.InnerText.Trim() }
+	}
+
+	$rows = [System.Collections.Generic.List[object]]::new()
+
+	foreach ($scope in @("Computer","User")) {
+		$scopeNode = $Report.GPO.SelectSingleNode("*[local-name()='$scope']")
+		if (-not $scopeNode) { continue }
+
+		foreach ($ext in $scopeNode.SelectNodes("*[local-name()='ExtensionData']")) {
+			$cse = & $childText $ext "Name"
+			$before = $rows.Count
+
+			# 1) Administrative Templates: every <Policy> node anywhere under this extension.
+			foreach ($p in $ext.SelectNodes(".//*[local-name()='Policy']")) {
+				# Compile the configured sub-values (drop-downs, numerics, text boxes, checkboxes, list items).
+				$valueParts = foreach ($vc in $p.SelectNodes("*[local-name()='DropDownList' or local-name()='EditText' or local-name()='Numeric' or local-name()='Checkbox' or local-name()='ListBox' or local-name()='MultiText' or local-name()='Text']")) {
+					$shown = @((& $childText $vc "Name"), (& $childText $vc "Value"), (& $childText $vc "State") | Where-Object { $_ }) -join ": "
+					if ($shown) { $shown }
+				}
+
+				$rows.Add([pscustomobject]@{
+					Domain = $Domain; GPO = $GPOName; Scope = $scope; Extension = $cse
+					Category = (& $childText $p "Category"); Setting = (& $childText $p "Name"); State = (& $childText $p "State")
+					Value = (@($valueParts) -join " | ")
+				})
+			}
+
+			# 2) Generic flatten for every other extension (Security, Preferences, Scripts, etc.).
+			if ($rows.Count -eq $before) {
+				$extNode = $ext.SelectSingleNode("*[local-name()='Extension']")
+				if ($extNode) {
+					foreach ($node in $extNode.ChildNodes) {
+						if ($node.NodeType -ne [System.Xml.XmlNodeType]::Element) { continue }
+
+						# Setting name: a <Name> child, else a name/KeyName attribute, else the element's tag name.
+						$setting = & $childText $node "Name"
+						if (-not $setting) { $setting = $node.GetAttribute("name") }
+						if (-not $setting) { $setting = $node.GetAttribute("KeyName") }
+						if (-not $setting) { $setting = $node.LocalName }
+
+						# Value: text from common value-bearing descendants (kept narrow to avoid Explain-text noise).
+						$valueParts = foreach ($v in $node.SelectNodes(".//*[local-name()='SettingNumber' or local-name()='SettingBoolean' or local-name()='SettingString' or local-name()='DisplayString' or local-name()='Value' or local-name()='State' or local-name()='Member']")) {
+							$t = $v.InnerText.Trim(); if ($t) { $t }
+						}
+
+						$rows.Add([pscustomobject]@{
+							Domain = $Domain; GPO = $GPOName; Scope = $scope; Extension = $cse
+							Category = $node.LocalName; Setting = $setting; State = ""
+							Value = (@($valueParts | Select-Object -Unique) -join "; ")
+						})
+					}
+				}
+			}
+
+			# 3) Nothing itemizable: leave a presence row so the extension is never invisible.
+			if ($rows.Count -eq $before) {
+				$rows.Add([pscustomobject]@{
+					Domain = $Domain; GPO = $GPOName; Scope = $scope; Extension = $cse
+					Category = ""; Setting = "(configured - not itemized)"; State = ""; Value = ""
+				})
+			}
+		}
+	}
+
+	return $rows
 }
 
 function Get-BasicInfo {
@@ -333,6 +555,7 @@ function Get-ForestDomainInfo {
 			Write-Log "Gathering domain information for $($domain.DNSRoot)..."
 			$domainInfo = [ordered]@{
 				"Domain DNS Name" = $domain.DNSRoot;
+				"Domain NetBIOS Name" = $domain.NetBIOSName;
 				"Parent Domain" = $domain.ParentDomain;
 				"Functional Level" = $domain.DomainMode | Split-CamelCaseString;
 				"Domain Controller Count" = $domain.ReplicaDirectoryServers.Count;
@@ -487,9 +710,11 @@ function Get-ForestDomainInfo {
 
 			if ($Settings["AdminIsPrivileged"]) {
 				Write-Log "- Collecting remote system information from $($dc.HostName)..." -Level VERBOSE
-				$remoteInfo = Get-RemoteSystemInfo -ComputerName $dc.HostName
-				foreach ($key in $remoteInfo.Keys) {
-					$dcInfo[$key] = $remoteInfo[$key]
+				$remoteInfo = Get-RemoteSystemInfo -ComputerName $dc.HostName | Select-Object -First 1
+				if ($remoteInfo) {
+					foreach ($prop in $remoteInfo.PSObject.Properties) {
+						if ($prop.Name -ne "Computer") { $dcInfo[$prop.Name] = $prop.Value }
+					}
 				}
 			}
 
@@ -502,7 +727,7 @@ function Get-ForestDomainInfo {
 	if ($Reports -contains "GPOs") {
 		Write-Log "Enumerating Group Policy Objects..."
 
-		if (-not (Get-Module -ListAvailable -Name GroupPolicy)) {
+		if ((Get-Command 'Get-GPO','Get-GPOReport' -ErrorAction SilentlyContinue).Count -ne 2) {
 			Write-Log "The GroupPolicy module is not available on this system. Skipping GPO discovery. Install the RSAT Group Policy Management Tools to enable it." -Level WARNING
 		} else {
 			Import-Module GroupPolicy -ErrorAction SilentlyContinue
@@ -517,8 +742,26 @@ function Get-ForestDomainInfo {
 					continue
 				}
 
+				# Accumulates the flattened per-setting rows across every GPO in this domain.
+				$GPOSettings = [System.Collections.Generic.List[object]]::new()
+
 				$GPOData = foreach ($gpo in $GPOs) {
-					$links = @(Get-GPOLinks -Guid $gpo.Id -Domain $domain -Server $script:PreferredDCs[$domain])
+					# Fetch the XML report once and reuse it for both link discovery and settings extraction.
+					$report = $null
+					try {
+						$report = [xml](Get-GPOReport -Guid $gpo.Id -ReportType Xml -Domain $domain -Server $script:PreferredDCs[$domain] -ErrorAction Stop)
+					} catch {
+						Write-Log "- Failed to retrieve the report for GPO '$($gpo.DisplayName)'. The specific error is: $_" -Level WARNING
+					}
+
+					if ($report) {
+						$links = @(Get-GPOLinks -Report $report)
+						foreach ($row in (ConvertFrom-GPOReportXml -Report $report -Domain $domain -GPOName $gpo.DisplayName)) {
+							$GPOSettings.Add($row)
+						}
+					} else {
+						$links = @(Get-GPOLinks -Guid $gpo.Id -Domain $domain -Server $script:PreferredDCs[$domain])
+					}
 
 					[ordered]@{
 						"Domain" = $domain;
@@ -537,6 +780,11 @@ function Get-ForestDomainInfo {
 				}
 
 				$GPOData | Write-Data -OutputFile "Group Policy Objects - $domain - $global:ScriptExecutionTimestamp.csv"
+
+				if ($GPOSettings.Count) {
+					$GPOSettings | Write-Data -OutputFile "GPO Settings - $domain - $global:ScriptExecutionTimestamp.csv"
+					Write-Log "- Compiled $($GPOSettings.Count) GPO setting(s) across $($GPOs.Count) GPOs in $domain."
+				}
 			}
 		}
 	}
@@ -1179,6 +1427,180 @@ function Get-ComputerServerInfo {
 	}
 
 	Start-ConfirmationTimer -Message "Computer/Server discovery complete"
+}
+
+function Get-ServerInventory {
+	Write-Host "Beginning server inventory"
+
+	Read-Host "This process requires a 'Servers.csv' file in the same directory as the main script. The CSV needs only a single column named 'fqdn' that contains the FQDN of each server to inventory. Press [ENTER] to continue."
+
+	$resumeFile = ".\Server Inventory.resume"
+	$outputFile = "Server Inventory (Incomplete).csv"
+	# Resolve the path Write-Data will actually use, so cleanup/rename target the real file.
+	$outputFullPath = $(if ($global:Settings["OutputInSubdirectory"]) { ".\OUTPUT\$outputFile" } else { $outputFile })
+	$batchSize = $global:Variables["InventoryBatchSize"] ?? 10
+	$batch = [System.Collections.Generic.List[string]]::new()
+
+	$completedServers = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+
+	if (Test-Path $resumeFile) {
+		if (Get-Confirmation -Message "Unfinished inventory detected. Resume?" -DefaultToYes) {
+			Get-Content $resumeFile | Where-Object { $_ } | ForEach-Object { [void]$completedServers.Add($_) }
+			Write-Log "Resuming server inventory: $($completedServers.Count) already-processed server(s) will be skipped."
+		} else {
+			Remove-Item $resumeFile -Force -ErrorAction SilentlyContinue
+			Remove-Item $outputFullPath -Force -ErrorAction SilentlyContinue
+		}
+	}
+
+	Write-Host "Reading list of servers from servers.csv"
+	try {
+		$Servers = (Import-Csv -Path "Servers.csv" -ErrorAction Stop).Fqdn
+		Write-Log "Read $($Servers.Count) servers in servers.csv"
+	} catch {
+		Write-Log "Failed to load Servers.csv. The specific error is: $_" -Level ERROR
+		Read-Host "Press [ENTER] to return to the menu."
+		return
+	}
+
+	$batchCount = 0
+	$errorObjects = 0
+	foreach ($server in $Servers) {
+		if (-not $completedServers.Contains($server)) {
+			$batch.Add($server)
+
+			if ($batch.Count -eq $batchSize) {
+				$batchCount++
+				$results = Get-RemoteSystemInfo $batch.ToArray()
+				Write-Host "Processed $batchCount batches"
+
+				$results | Write-Data -OutputFile $outputFile
+				$errorObjects += ($results | Where-Object { [string]::IsNullOrEmpty($_.Error) -eq $false }).Count
+				if ($batchCount -ge 5 -and ($errorObjects / ($batchCount * $batchSize) -ge .6)) {
+					if (Get-Confirmation -Message "The inventory is encountering too many errors (>60% after 5 batches). Stop the inventory to allow for remediation?" -DefaultToYes) {
+						Read-Host "Press [ENTER] to return to the menu"
+						return
+					} else {
+						Write-Log "Continuing inventory despite high error rate." -Level WARNING
+					}
+				}
+				
+				Add-Content -Path $resumeFile -Value $batch
+				foreach ($record in $batch) { [void]$completedServers.Add($record) }
+				$batch.Clear()
+			}
+		}
+	}
+
+	if ($batch.Count -gt 0) {
+		$results = Get-RemoteSystemInfo $batch.ToArray()
+
+		$results | Write-Data -OutputFile $outputFile
+		Add-Content -Path $resumeFile -Value $batch
+		foreach ($record in $batch) { [void]$completedServers.Add($record) }
+		$batch.Clear()
+	}
+
+	# Finalize: rename the in-progress file to the timestamped convention (Move-Item accepts a full path,
+	# unlike Rename-Item -NewName). Only if it was actually produced this run.
+	if (Test-Path $outputFullPath) {
+		Move-Item -Path $outputFullPath -Destination ($outputFullPath -replace '\(Incomplete\)', "- $global:ScriptExecutionTimestamp") -Force
+	}
+
+	if (Test-Path $resumeFile) { Remove-Item $resumeFile -Force }
+	Write-Log "All inventories complete."
+
+	Start-ConfirmationTimer -Message "Returning to main menu..."
+}
+
+function Get-FileshareInventory {
+	Write-Host "Beginning file share inventory"
+
+	Read-Host "This process requires a 'Fileshares.csv' file in the same directory as the main script. The CSV needs only a single column named 'ShareUNC' that contains the UNC path of each share to inventory. Press [ENTER] to continue."
+
+	$resumeFile = ".\File Share Inventory.resume"
+	$outputFile = "File Share Inventory (Incomplete).csv"
+	
+	$outputFullPath = $(if ($global:Settings["OutputInSubdirectory"]) { ".\OUTPUT\$outputFile" } else { $outputFile })
+
+	$Script:TraversedFolders = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+
+	$MaxTraversalDepth = $Global:Variables["MaxTraversalDepth"] ?? 2
+
+	if (Test-Path $resumeFile) {
+		if (Get-Confirmation -Message "Unfinished inventory detected. Resume?" -DefaultToYes) {
+			Get-Content $resumeFile | Where-Object { $_ } | ForEach-Object { [void]$TraversedFolders.Add($_) }
+			Write-Log "Resuming file share inventory: $($TraversedFolders.Count) already-processed folders(s) will be skipped."
+		} else {
+			Remove-Item $resumeFile -Force -ErrorAction SilentlyContinue
+			Remove-Item $outputFullPath -Force -ErrorAction SilentlyContinue
+		}
+	}
+
+	Write-Host "Reading list of shares from Fileshares.csv"
+	try {
+		$Shares = (Import-Csv -Path "Fileshares.csv" -ErrorAction Stop).ShareUNC
+		Write-Log "Read $($Shares.Count) shares in Fileshares.csv"
+	} catch {
+		Write-Log "Failed to load Fileshares.csv. The specific error is: $_" -Level ERROR
+		Read-Host "Press [ENTER] to return to the menu."
+		return
+	}
+
+	$report = [System.Collections.Generic.List[psobject]]::new()
+
+	$errorObjects = 0
+	
+	$UserPassSplat = @{}
+	if ($global:Settings["UseAdminCredential"] -and $global:CredSplat["Credential"]) {
+		$UserPassSplat = @{
+			"UserName" = $global:CredSplat["Credential"].UserName;
+			"Password" = $global:CredSplat["Credential"].GetNetworkCredential().Password
+		}
+	}
+
+	foreach ($share in $Shares) {
+		if (-not $TraversedFolders.Contains($share)) {
+			Write-Log "Connecting to $share$($UserPassSplat ? " with credentials $($UserPassSplat.UserName)" : '')"
+			Remove-SmbMapping -RemotePath $share -Force -ErrorAction SilentlyContinue
+			New-SmbMapping -RemotePath $share -Persistent $false @UserPassSplat
+
+			$folderSize = Get-FolderSize -Path $share
+			$permissions = Get-PermissionsSummary -Path $share
+
+			$report.Add([pscustomobject]@{
+				"Share" = $share;
+				"Path" = "/";
+				"Level" = 0;
+				"FullPath" = $share;
+				"SizeMB" = $folderSize;
+				"Permissions" = $permissions;
+			})
+
+			$folderResults = Get-TraversedFolders -Path $share -Depth 1 -MaxTraversalDepth $MaxTraversalDepth -RelativeName "" -ShareName $share -ResumeFile $resumeFile
+			if ($folderResults -and $folderResults.Count -gt 0) {
+				$report.AddRange([psobject[]]$folderResults)
+			}
+
+			$report | Write-Data -OutputFile $OutputFile
+			[void]$TraversedFolders.Add($share)
+			Write-Log "Completed inventory of $share"
+
+			Remove-SmbMapping -RemotePath $share -Force -ErrorAction SilentlyContinue
+		}
+		Start-Sleep -Seconds $Global:Variables["FileshareThrottleInSecs"]
+	}
+
+	# Finalize: rename the in-progress file to the timestamped convention (Move-Item accepts a full path,
+	# unlike Rename-Item -NewName). Only if it was actually produced this run.
+	if (Test-Path $outputFullPath) {
+		Move-Item -Path $outputFullPath -Destination ($outputFullPath -replace '\(Incomplete\)', "- $global:ScriptExecutionTimestamp") -Force
+	}
+
+	if (Test-Path $resumeFile) { Remove-Item $resumeFile -Force }
+	Write-Log "All inventories complete."
+
+	Start-ConfirmationTimer -Message "Returning to main menu..."
 }
 
 function Get-AllInfo {

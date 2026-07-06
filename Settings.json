@@ -10,10 +10,10 @@
 		"LogsInSubdirectory" : true, // If set to true, log files will be stored in a "Logs" subdirectory of the script's directory. If false, log files will be stored in the same directory as the script.
 		"OutputInSubdirectory" : true, // If set to true, output files will be stored in a "Output" subdirectory of the script's directory. If false, output files will be stored in the same directory as the script.
 		"RequiredModules" : [], // A list of module names that the script will check for and attempt to import at runtime. If any of the modules cannot be imported, the script will terminate with an error.
-		"UseAdminCredentials" : false, // If set to true, the script will attempt to load administrator credentials from the specified file and use them for any operations that require authentication. Those credentials can be referenced by adding @CredSplat to any cmdlet calls that support the -Credential parameter. If this setting is false, the script will not attempt to load any credentials and will run with the current user's context.
-		"AdminUsername" : "", // If UseAdminCredentials is true, this setting specifies the username to use for administrator credentials. If AdminCredentialPassFile is specified and contains a valid password, the script will attempt to create a PSCredential object using this username and the password from the file.
-		"AdminCredentialPassFile" : "", // If UseAdminCredentials is true, the script will attempt to read a "Secure String" password from this file. If this setting is blank, the script will prompt the user for credentials at launch.
-		"AdminIsPrivileged" : false, // Whether the provided "admin" account has privileges to connect to remote computers for enumeration. If set to false, the script will only pull data that can be accessed by a standard Domain User account.
+		"UseAdminCredential" : true, // If set to true, the script will attempt to load administrator credentials from the specified file and use them for any operations that require authentication. Those credentials can be referenced by adding @CredSplat to any cmdlet calls that support the -Credential parameter. If this setting is false, the script will not attempt to load any credentials and will run with the current user's context.
+		"AdminUsername" : "", // If UseAdminCredential is true, this setting specifies the username to use for administrator credentials. If AdminCredentialPassFile is specified and contains a valid password, the script will attempt to create a PSCredential object using this username and the password from the file.
+		"AdminCredentialPassFile" : "", // If UseAdminCredential is true, the script will attempt to read a "Secure String" password from this file. If this setting is blank, the script will prompt the user for credentials at launch.
+		"AdminIsPrivileged" : true, // Whether the provided "admin" account has privileges to connect to remote computers for enumeration. If set to false, the script will only pull data that can be accessed by a standard Domain User account.
 		"DryRun" : false // If set to true, any cmdlets that support the -WhatIf parameter will be run with that parameter, to prevent changes from being made to the system. Custom functions should check the $Settings["DryRun"] variable and use it to determine whether to make changes or not.
 		// You can specify any custom settings here. The module will automatically load them into the $Settings variable
 	},
@@ -23,6 +23,9 @@
 		"AdditionalUserAttributes" : [], // If you enable the "UseADSISearcher" switch and want to include additional attributes, you must populate these variables with the exact ADSI attribute name, not their ADWS/PowerShell aliases
 		"AdditionalGroupAttributes" : [],
 		"AdditionalComputerAttributes" : [],
-		"UseADSISearcher" : true // For large environments (100K+ objects), defer to using the ADSI and DirectorySearcher classes directory rather than the ADWS interface used by PowerShell cmdlets. This is used for users, groups, and computer objects, and typically yields better performance.
+		"UseADSISearcher" : false, // For large environments (100K+ objects), defer to using the ADSI and DirectorySearcher classes directory rather than the ADWS interface used by PowerShell cmdlets. This is used for users, groups, and computer objects, and typically yields better performance.
+		"InventoryBatchSize" : 20, // The number of servers to attempt to inventory in a single batch when performing computer discovery. Recommended limit is 50.
+		"MaxTraversalDepth" : 3, // The maximum number of folder levels to traverse when inventorying file shares.
+		"FileshareThrottleInSecs" : 0 // The number of seconds to wait between processing each file share during inventory.
 	}
 }
