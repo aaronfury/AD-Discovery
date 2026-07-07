@@ -1,0 +1,15 @@
+2026-07-07 12:55:13	INFO	: Initializing Start-ADDiscovery...
+2026-07-07 12:55:21	INFO	: Using admin credential corp\aw_ad as specified in the Settings file
+2026-07-07 12:55:21	INFO	: Welcome, Alexa.Ward. Your actions are being logged. You know, for accountability.
+2026-07-07 12:55:22	INFO	: CredSplat is set to: Credential
+2026-07-07 12:55:22	WARNING	: No domain specified in settings file (SourceDomain variable), attempting to determine domain from environment.
+2026-07-07 12:55:22	INFO	: Domain determined to be corp.alpha.local from environment.
+2026-07-07 12:55:22	INFO	: SkipForestDiscovery is set to true. Performing all actions only against corp.alpha.local
+2026-07-07 12:55:22	INFO	: Setting DC11.corp.alpha.local as the preferred (nearest) DC for corp.alpha.local
+2026-07-07 12:55:22	INFO	: Determining whether the current identity has elevated (privileged) rights in the domain/forest...
+2026-07-07 12:55:22	INFO	: Testing admin privileges for aw_ad
+2026-07-07 12:55:22	INFO	: The executing identity appears to hold privileged group membership. Remote management features will be enabled.
+2026-07-07 12:55:30	INFO	: Read 4 servers in Z:\AD-Discovery\Servers.txt
+2026-07-07 12:55:42	INFO	: All inventories complete.
+2026-07-07 12:56:04	INFO	: Exiting script...
+

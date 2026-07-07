@@ -174,9 +174,10 @@ function Get-RemoteSystemInfo {
 		[Parameter(Mandatory=$true)][string[]]$ComputerName
 	)
 
-	$sessionOptions = New-PSSessionOption -CancelTimeout 60000 -OpenTimeout 60000 -OperationTimeout 600000 -IdleTimeout 60000
+	$sessionOptions = New-PSSessionOption -CancelTimeout 60000 -OpenTimeout 60000 -OperationTimeout 300000 -IdleTimeout 60000
 
-	$BatchResults = Invoke-Command -ComputerName $ComputerName @global:CredSplat -SessionOption $sessionOptions -ErrorVariable InvokeFailures -ScriptBlock {
+	$JobTimeout = $ComputerName.Count * 60 # Allow a minute for each computer in the list
+	$BatchJob = Invoke-Command -ComputerName $ComputerName @global:CredSplat -SessionOption $sessionOptions -ErrorVariable InvokeFailures -AsJob -ScriptBlock {
 		$info = [ordered]@{
 			"Computer" = $env:ComputerName
 			"IPv4 Address" = $null
@@ -232,13 +233,40 @@ function Get-RemoteSystemInfo {
 		}
 		
 		try {
-			$roles = (Get-WindowsFeature | Where-Object {$_.Installed}).Name | Where-Object { $_ -notmatch "^NET*|^RSAT*|^PowerShell*|FileAndStorage-Services|File-Services|Wow64-Support|System-DataArchiver|*Defender*|AzureArcSetup|Storage-Services|Telnet-Client|XPS-Viewer|RDC|Windows-Server-Backup"}
+			$roles = (Get-WindowsFeature | Where-Object {$_.Installed}).Name | Where-Object { $_ -notmatch "(^NET.*)|(^RSAT.*)|(^PowerShell.*)|(FileAndStorage-Services)|(File-Services)|(Wow64-Support)|(System-DataArchiver)|(.*Defender.*)|(AzureArcSetup)|(Storage-Services)|(Telnet-Client)|(XPS-Viewer)|(RDC)|(Windows-Server-Backup)"}
 			$info["Installed Roles"] = $roles -join ", "
 		} catch {
 			$info["Error"] += "Roles: $_;"
 		}
 
 		return [pscustomobject]$info
+	}
+
+	$BatchStart = Get-Date
+	while ($BatchJob.State -eq "Running") {
+		Start-Sleep -Seconds 5
+		if ((Get-Date) - $BatchStart -gt [TimeSpan]::FromSeconds($JobTimeout)) {
+			Write-Log "Batch job timed out after $JobTimeout seconds" -Level ERROR
+			Stop-Job -Job $BatchJob
+			break
+		}
+	}
+	$BatchStatus = foreach ($invokation in $BatchJob.ChildJobs) {
+		if ($invokation.State -eq 'Completed') { $status = "Success"} else { $status = "Failed" }
+		$ErrorMessage = ($invokation.Error) ? $invokation.Error[0].Exception.Message : $invokation.JobStateInfo.Reason
+		[pscustomobject][ordered]@{
+			"Computer" = $invokation.Location
+			"Status" = $status
+			"ErrorMessage" = $ErrorMessage
+		}
+	}
+	$BatchResults = Receive-Job -Job $BatchJob -Wait -AutoRemoveJob | Where-Object { $_.PSComputerName -in ($BatchStatus | Where-Object { $_.Status -eq "Success" } | Select-Object -ExpandProperty Computer )}
+	
+	$failedInvokes = foreach ($failed in $BatchStatus | Where-Object { $_.Status -eq "Failed" }) {
+		[pscustomobject][ordered]@{
+			"Computer" = $failed.Computer
+			"Error" = "WinRM: $($failed.ErrorMessage)"
+		}
 	}
 
 	# Synthesize a row for every server Invoke-Command could not reach (connection/auth/timeout), so each
@@ -256,7 +284,7 @@ function Get-RemoteSystemInfo {
 	# Project every row (remote successes + synthesized failures) onto the same column set. Missing properties become $null, which keeps the CSV columns aligned regardless of which row is written first.
 	$columns = @("Computer","IPv4 Address","AD Site","CPU Cores","Total RAM (GB)","Total Storage (GB)","Free Storage (GB)","Last Boot","Uptime (Days)","Largest 5 apps","Root Folders","Program Files Folders","Installed Roles","Error")
 
-	return @($BatchResults) + @($failureRecords) | Select-Object $columns
+	return @($BatchResults) + @($failureRecords) + @($failedInvokes) | Select-Object $columns
 }
 
 function Get-GPOLinks {
@@ -1434,7 +1462,55 @@ function Get-ComputerServerInfo {
 function Get-ServerInventory {
 	Write-Host "Beginning server inventory"
 
-	Read-Host "This process requires a 'Servers.csv' file in the same directory as the main script. The CSV needs only a single column named 'fqdn' that contains the FQDN of each server to inventory. Press [ENTER] to continue."
+	Write-Host "This process requires a 'Servers' file in the same directory as the main script. If it's a CSV, it needs only a single column named 'fqdn' that contains the FQDN of each server to inventory. If it's a plain text file, it should contain one FQDN per line."
+
+	$inputFiles = Get-ChildItem -Path . -Filter "Servers*" -File
+	switch ($inputFiles.Count) {
+		0 {
+			Write-Log "No 'Servers' input file found in the current directory." -Level ERROR
+			Read-Host "Press [ENTER] to return to the menu."
+			return
+		}
+		1 {
+			$file = $inputFiles[0].Name
+			break;
+		}
+		default {
+			Write-Host "Select the 'Servers' input file to use:"
+			for ($i=1; $i -le $inputFiles.Count; $i++) {
+				Write-Host "$i. $($inputFiles[$i-1].Name)"
+			}
+			Write-Host "X. Cancel"
+			$selection = Read-Host "Enter the number corresponding to the 'Servers' input file to use, or 'X' to cancel"
+			if ($selection -match '^\d+$' -and $selection -ge 1 -and $selection -le $inputFiles.Count) {
+				$file = $inputFiles[$selection-1].Name
+				break;
+			} elseif ($selection -match '^[Xx]$') {
+				Write-Log "User canceled 'Servers' input file selection." -Level ERROR
+				Read-Host "Press [ENTER] to return to the menu."
+				return
+			} else {
+				Write-Log "Invalid selection for 'Servers' input file." -Level ERROR
+				Read-Host "Press [ENTER] to return to the menu."
+				return
+			}
+		}
+	}
+	$file = Get-Item -Path $file
+	switch ($file.Extension.ToLower()) {
+		".csv" {
+			$Servers = Import-Csv -Path $file | Select-Object -ExpandProperty fqdn
+		}
+		".txt" {
+			$Servers = Get-Content -Path $file | Where-Object { $_ }
+		}
+		default {
+			Write-Log "Unsupported 'Servers' input file type: $file" -Level ERROR
+			Read-Host "Press [ENTER] to return to the menu."
+			return
+		}
+	}
+	Write-Log "Read $($Servers.Count) servers in $file"
 
 	$resumeFile = ".\Server Inventory.resume"
 	$outputFile = "Server Inventory (Incomplete).csv"
@@ -1453,16 +1529,6 @@ function Get-ServerInventory {
 			Remove-Item $resumeFile -Force -ErrorAction SilentlyContinue
 			Remove-Item $outputFullPath -Force -ErrorAction SilentlyContinue
 		}
-	}
-
-	Write-Host "Reading list of servers from servers.csv"
-	try {
-		$Servers = (Import-Csv -Path "Servers.csv" -ErrorAction Stop).Fqdn
-		Write-Log "Read $($Servers.Count) servers in servers.csv"
-	} catch {
-		Write-Log "Failed to load Servers.csv. The specific error is: $_" -Level ERROR
-		Read-Host "Press [ENTER] to return to the menu."
-		return
 	}
 
 	$batchCount = 0
