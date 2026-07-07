@@ -522,7 +522,7 @@ function Get-ForestDomainInfo {
 	if ($Reports -contains "ForestAndDomains") {
 		try {
 			Write-Log "Enumerating domains..."
-			$AllDomains = $script:Forest.Domains | foreach { Get-AdDomain $_ @CredSplat }
+			$AllDomains = $script:Forest.Domains | ForEach-Object { Get-AdDomain $_ @CredSplat }
 		} catch {
 			Write-Log " - Unable to enumerate domains. The specific error is: $_" -Level ERROR
 			return
@@ -587,7 +587,7 @@ function Get-ForestDomainInfo {
 		foreach ($domain in $AllDomains) {
 			$OUs = Get-ADOrganizationalUnit -Filter * -Properties CanonicalName,Description -Server $script:PreferredDCs[$domain.DNSRoot] @CredSplat
 			Write-Log "- Read $($OUs.Count) OUs in $($domain.DNSRoot)"
-			$OUs | Select CanonicalName,Name,Description | Write-Data -OutputFile "OUs - $($domain.DNSroot) - $global:ScriptExecutionTimestamp.csv"
+			$OUs | Select-Object CanonicalName,Name,Description | Write-Data -OutputFile "OUs - $($domain.DNSroot) - $global:ScriptExecutionTimestamp.csv"
 		}
 
 		# Trust Information - per-domain, source/target, directionality, type, whether target domain is active, creation, and modification
@@ -669,7 +669,7 @@ function Get-ForestDomainInfo {
 				if (Test-Path .\baselineschema.csv) {
 					$BaselineAttributes = Import-Csv .\baselineschema.csv
 					Write-Log "- - Read $($BaselineAttributes.Count) records from baselineattributes.csv"
-					$SchemaAttributes = $SchemaAttributes | where {$_.attributeID -notin $BaselineAttributes.attributeID}
+					$SchemaAttributes = $SchemaAttributes | Where-Object {$_.attributeID -notin $BaselineAttributes.attributeID}
 					Write-Log "Removed baseline attributes from forest schema list, leaving $($SchemaAttributes.Count) attributes"
 				}
 			} catch {
@@ -677,10 +677,10 @@ function Get-ForestDomainInfo {
 			}
 
 			# Filter additional known attributes
-			$SchemaAttributes = $SchemaAttributes | where {$_.name -notlike "msExch*" -and $_.name -notlike "ms*"}
+			$SchemaAttributes = $SchemaAttributes | Where-Object {$_.name -notlike "msExch*" -and $_.name -notlike "ms*"}
 
 			if ($SchemaAttributes.Count) {
-				$SchemaData = $SchemaAttributes | Select Name,Created,Modified,@{n="Attribute ID"; e={$_.attributeID}}
+				$SchemaData = $SchemaAttributes | Select-Object Name,Created,Modified,@{n="Attribute ID"; e={$_.attributeID}}
 			} else {
 				$SchemaData = @{"Schema Discovery" = "No custom schema attributes detected"}
 			}
@@ -829,7 +829,7 @@ function Get-ForestDomainInfo {
 					$dcInfo["DCDIAG - $test"] = "OK"
 				}
 				else {
-					$dcInfo["DCDIAG - $test"] = (($dcdiagResult | Select-String "error", "warning" | foreach { $_.Line.Trim() }) -join "`n")
+					$dcInfo["DCDIAG - $test"] = (($dcdiagResult | Select-String "error", "warning" | ForEach-Object { $_.Line.Trim() }) -join "`n")
 				}
 			}
 
@@ -857,7 +857,7 @@ function Get-ForestDomainInfo {
 
 		Write-Log "Checking for conflict objects..."
 		if (-not $AllDomains.Count) {
-			$AllDomains = $script:Forest.Domains | foreach { Get-AdDomain $_ @CredSplat }
+			$AllDomains = $script:Forest.Domains | ForEach-Object { Get-AdDomain $_ @CredSplat }
 		}
 		foreach ($domain in $AllDomains) {
 			try {
@@ -876,7 +876,7 @@ function Get-ForestDomainInfo {
 
 		Write-Log "Checking for orphaned objects..."
 		if (-not $AllDomains.Count) {
-			$AllDomains = $script:Forest.Domains | foreach { Get-AdDomain $_ @CredSplat }
+			$AllDomains = $script:Forest.Domains | ForEach-Object { Get-AdDomain $_ @CredSplat }
 		}
 		foreach ($domain in $AllDomains) {
 			try {
@@ -1331,7 +1331,7 @@ function Get-UserGroupInfo {
 			$nestedGroups = Get-ADGroup -Filter {MemberOf -like "*"} -Properties MemberOf @CredSplat -Server $script:PreferredDCs[$domain]
 			Write-Log "Found $(@($nestedGroups).Count) nested groups in $domain"
 
-			$nestedGroups | Select Name,DistinguishedName, GroupScope, GroupCategory, @{n="Member Of";e={$_.MemberOf -join "; "}} | Write-Data -Outputfile "Nested Groups - $domain - $global:ScriptExecutionTimestamp.csv"
+			$nestedGroups | Select-Object Name,DistinguishedName, GroupScope, GroupCategory, @{n="Member Of";e={$_.MemberOf -join "; "}} | Write-Data -Outputfile "Nested Groups - $domain - $global:ScriptExecutionTimestamp.csv"
 		}
 	}
 
@@ -1469,7 +1469,30 @@ function Get-ServerInventory {
 	foreach ($server in $Servers) {
 		if (-not $completedServers.Contains($server)) {
 			if ($(try { [bool](Resolve-DnsName -Name "$server" -ErrorAction Stop) } catch { $false })) {
-				$batch.Add($server)
+				if($(try { [bool](Test-Connection -ComputerName "$server" -Count 1 -Quiet -ErrorAction Stop) } catch { $false })) {
+					$batch.Add($server)
+				} else {
+					$info = [ordered]@{
+						"Computer" = $server
+						"IPv4 Address" = $null
+						"AD Site" = $null
+						"CPU Cores" = $null
+						"Total RAM (GB)" = $null
+						"Total Storage (GB)" = $null
+						"Free Storage (GB)" = $null
+						"Last Boot" = $null
+						"Uptime (Days)" = $null
+						"Largest 5 apps" = $null
+						"Root Folders" = $null
+						"Program Files Folders" = $null
+						"Installed Roles" = $null
+						"Error" = "Failed to reach host via ping"
+					}
+					$info | Write-Data -OutputFile $outputFile
+					Add-Content -Path $resumeFile -Value $server
+					[void]$completedServers.Add($server)
+					continue
+				}
 			} else {
 				$info = [ordered]@{
 					"Computer" = $server
@@ -1572,8 +1595,6 @@ function Get-FileshareInventory {
 	}
 
 	$report = [System.Collections.Generic.List[psobject]]::new()
-
-	$errorObjects = 0
 	
 	$UserPassSplat = @{}
 	if ($global:Settings["UseAdminCredential"] -and $global:CredSplat["Credential"]) {
