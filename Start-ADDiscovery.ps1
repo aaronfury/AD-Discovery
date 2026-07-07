@@ -143,7 +143,8 @@ function Test-AdminPrivilege {
 		}
 
 		Write-Log "Testing admin privileges for $samAccount"
-		$adUser = Get-ADUser -Identity $samAccount | Get-ADUser -Properties "tokenGroups","memberOf" @CredSplat @eaSplat
+		$adUser = Get-ADUser -Identity $samAccount | ForEach-Object { Get-ADUser -Identity $_.DistinguishedName -Properties "tokenGroups","memberOf" @CredSplat @eaSplat }
+		#$adUser = Get-ADUser -Identity $samAccount | Get-ADUser -Properties "tokenGroups","memberOf" @CredSplat @eaSplat
 
 		# tokenGroups expands all (including nested) group memberships present in the user's token.
 		foreach ($sid in @($adUser.tokenGroups | ForEach-Object { $_.Value })) {
@@ -222,8 +223,8 @@ function Get-RemoteSystemInfo {
 		}
 
 		try {
-			$rootFolders = Get-ChildItem C:\ -Directory | Where-Object {$_.Name -notlike "Windows*"}
-			$programFileFolders = Get-ChildItem $env:ProgramFiles,${env:ProgramFiles(x86)} -Directory -ErrorAction SilentlyContinue
+			$rootFolders = Get-ChildItem C:\ -Directory | Where-Object {$_.Name -notmatch "Windows.*|Program Files.*|PerfLogs"}
+			$programFileFolders = Get-ChildItem $env:ProgramFiles,${env:ProgramFiles(x86)} -Directory -ErrorAction SilentlyContinue | Where-Object {$_.Name -notmatch "Common Files|Windows.*|Internet Explorer"}
 			$info["Root Folders"] = $rootFolders.Name -join ", "
 			$info["Program Files Folders"] = $programFileFolders.Name -join ", "
 		} catch {
@@ -231,7 +232,7 @@ function Get-RemoteSystemInfo {
 		}
 		
 		try {
-			$roles = (Get-WindowsFeature | Where-Object {$_.Installed}).Name | Where-Object { $_ -notmatch "^NET*|^RSAT*|^PowerShell*|FileAndStorage-Services|File-Services|Wow64-Support|System-DataArchiver"}
+			$roles = (Get-WindowsFeature | Where-Object {$_.Installed}).Name | Where-Object { $_ -notmatch "^NET*|^RSAT*|^PowerShell*|FileAndStorage-Services|File-Services|Wow64-Support|System-DataArchiver|*Defender*|AzureArcSetup|Storage-Services|Telnet-Client|XPS-Viewer|RDC|Windows-Server-Backup"}
 			$info["Installed Roles"] = $roles -join ", "
 		} catch {
 			$info["Error"] += "Roles: $_;"
