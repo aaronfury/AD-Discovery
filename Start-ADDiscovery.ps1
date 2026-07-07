@@ -199,7 +199,7 @@ function Get-RemoteSystemInfo {
 			$disks = Get-CimInstance -ClassName Win32_LogicalDisk -Filter "DriveType=3" -ErrorAction Stop
 			$nic = Get-CimInstance -ClassName Win32_NetworkAdapterConfiguration -Filter "IPEnabled = True" -ErrorAction Stop
 			$info["IPv4 Address"] = ($nic | Select-Object -ExpandProperty IPAddress | Where-Object { $_ -match '\d+\.\d+\.\d+\.\d+' } | Select-Object -First 1)
-			$info["AD Site"] = (Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\Netlogon\Parameters" -Name "DynamicSiteName" | Select-Object -ExpandProperty DynamicSiteName)
+			$info["AD Site"] = (Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\Netlogon\Parameters" -Name "DynamicSiteName" -ErrorAction SilentlyContinue | Select-Object -ExpandProperty DynamicSiteName)
 			$info["CPU Cores"] = $cs.NumberOfLogicalProcessors
 			$info["Total RAM (GB)"] = [math]::Round($cs.TotalPhysicalMemory / 1GB, 1)
 			$info["Total Storage (GB)"] = [math]::Round((($disks | Measure-Object -Property Size -Sum).Sum) / 1GB, 1)
@@ -208,7 +208,6 @@ function Get-RemoteSystemInfo {
 			$info["Uptime (Days)"] = [math]::Round(((Get-Date) - $os.LastBootUpTime).TotalDays, 1)
 		} catch {
 			$info["Error"] += "Basic info: $_;"
-			return [pscustomobject]$info
 		}
 	
 		try {
@@ -247,11 +246,13 @@ function Get-RemoteSystemInfo {
 	$failureRecords = foreach ($failure in $InvokeFailures) {
 		$msg = $(if ($failure.Exception -and $failure.Exception.Message) { $failure.Exception.Message } else { "$failure" })
 		if ($msg.Length -gt 250) { $msg = $msg.Substring(0, 250) + "..." }
-		[pscustomobject]@{ "Computer" = $failure.TargetObject; "Error" = $msg }
+		[pscustomobject][ordered]@{
+			"Computer" = $failure.CategoryInfo.TargetName
+			"Error" = $msg
+		}
 	}
 
-	# Project every row (remote successes + synthesized failures) onto the same column set. Missing
-	# properties become $null, which keeps the CSV columns aligned regardless of which row is written first.
+	# Project every row (remote successes + synthesized failures) onto the same column set. Missing properties become $null, which keeps the CSV columns aligned regardless of which row is written first.
 	$columns = @("Computer","IPv4 Address","AD Site","CPU Cores","Total RAM (GB)","Total Storage (GB)","Free Storage (GB)","Last Boot","Uptime (Days)","Largest 5 apps","Root Folders","Program Files Folders","Installed Roles","Error")
 
 	return @($BatchResults) + @($failureRecords) | Select-Object $columns
@@ -1467,7 +1468,30 @@ function Get-ServerInventory {
 	$errorObjects = 0
 	foreach ($server in $Servers) {
 		if (-not $completedServers.Contains($server)) {
-			$batch.Add($server)
+			if ($(try { [bool](Resolve-DnsName -Name "$server" -ErrorAction Stop) } catch { $false })) {
+				$batch.Add($server)
+			} else {
+				$info = [ordered]@{
+					"Computer" = $server
+					"IPv4 Address" = $null
+					"AD Site" = $null
+					"CPU Cores" = $null
+					"Total RAM (GB)" = $null
+					"Total Storage (GB)" = $null
+					"Free Storage (GB)" = $null
+					"Last Boot" = $null
+					"Uptime (Days)" = $null
+					"Largest 5 apps" = $null
+					"Root Folders" = $null
+					"Program Files Folders" = $null
+					"Installed Roles" = $null
+					"Error" = "Failed to resolve DNS host name"
+				}
+				$info | Write-Data -OutputFile $outputFile
+				Add-Content -Path $resumeFile -Value $server
+				[void]$completedServers.Add($server)
+				continue
+			}
 
 			if ($batch.Count -eq $batchSize) {
 				$batchCount++
