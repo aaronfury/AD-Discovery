@@ -1518,7 +1518,7 @@ function Get-ComputerServerInfo {
 function Get-ServerInventory {
 	Write-Host "Beginning server inventory"
 
-	$Servers = Get-InputObjects -FilePrefix "Servers"
+	$Servers = Get-InputFile -FilePrefix "Servers"
 	if (-not $Servers) {
 		Read-Host "Press [ENTER] to return to the menu."
 		return
@@ -1643,7 +1643,7 @@ function Get-ServerInventory {
 function Get-FileshareInventory {
 	Write-Host "Beginning file share inventory"
 
-	$Shares = Get-InputObjects -FilePrefix "Fileshares"
+	$Shares = Get-InputFile -FilePrefix "Fileshares"
 	if (-not $Shares) {
 		Read-Host "Press [ENTER] to return to the menu."
 		return
