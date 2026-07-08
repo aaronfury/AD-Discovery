@@ -224,8 +224,8 @@ function Get-RemoteSystemInfo {
 		}
 
 		try {
-			$rootFolders = Get-ChildItem C:\ -Directory | Where-Object {$_.Name -notmatch "Windows.*|Program Files.*|PerfLogs"}
-			$programFileFolders = Get-ChildItem $env:ProgramFiles,${env:ProgramFiles(x86)} -Directory -ErrorAction SilentlyContinue | Where-Object {$_.Name -notmatch "Common Files|Windows.*|Internet Explorer"}
+			$rootFolders = Get-ChildItem C:\ -Directory | Where-Object {$_.Name -notmatch "(Windows.*)|(Program Files.*)|(PerfLogs)"}
+			$programFileFolders = Get-ChildItem $env:ProgramFiles,${env:ProgramFiles(x86)} -Directory -ErrorAction SilentlyContinue | Where-Object {$_.Name -notmatch "(Common Files)|(Windows.*)|(Internet Explorer)"}
 			$info["Root Folders"] = $rootFolders.Name -join ", "
 			$info["Program Files Folders"] = $programFileFolders.Name -join ", "
 		} catch {
@@ -337,6 +337,62 @@ function Get-FolderSize {
 		return [math]::Round(([int64]$bytes / 1MB), 2)
 	}
 	return $null
+}
+
+function Get-InputFile {
+	param(
+		[Parameter(Mandatory=$true)][string]$FilePrefix
+	)
+
+	Write-Host "This process requires a '$FilePrefix' file in the same directory as the main script. If it's a CSV, it needs only a single column named '$FilePrefix' that contains the UNC path of each share to inventory. If it's a text file, it needs to contain one UNC path per line."
+
+	$inputFiles = Get-ChildItem -Path . -Filter "$FilePrefix*" -File
+	switch ($inputFiles.Count) {
+		0 {
+			Write-Log "No '$FilePrefix' input file found in the current directory." -Level ERROR
+			Read-Host "Press [ENTER] to return to the menu."
+			return
+		}
+		1 {
+			$file = $inputFiles[0].Name
+			break;
+		}
+		default {
+			Write-Host "Select the '$FilePrefix' input file to use:"
+			for ($i=1; $i -le $inputFiles.Count; $i++) {
+				Write-Host "$i. $($inputFiles[$i-1].Name)"
+			}
+			Write-Host "X. Cancel"
+			$selection = Read-Host "Enter the number corresponding to the '$FilePrefix' input file to use, or 'X' to cancel"
+			if ($selection -match '^\d+$' -and $selection -ge 1 -and $selection -le $inputFiles.Count) {
+				$file = $inputFiles[$selection-1].Name
+				break;
+			} elseif ($selection -match '^[Xx]$') {
+				Write-Log "User canceled '$FilePrefix' input file selection." -Level ERROR
+				return
+			} else {
+				Write-Log "Invalid selection for '$FilePrefix' input file." -Level ERROR
+				return
+			}
+		}
+	}
+	Write-Log "Using '$FilePrefix' input file: $file"
+	$file = Get-Item -Path $file
+	switch ($file.Extension.ToLower()) {
+		".csv" {
+			$Objects = Import-Csv -Path $file | Select-Object -ExpandProperty $FilePrefix
+		}
+		".txt" {
+			$Objects = Get-Content -Path $file | Where-Object { $_ }
+		}
+		default {
+			Write-Log "Unsupported '$FilePrefix' input file type: $($file.Extension)" -Level ERROR
+			Read-Host "Press [ENTER] to return to the menu."
+			return
+		}
+	}
+	Write-Log "Read $($Objects.Count) objects in '$FilePrefix' input file: $file"
+	return $Objects
 }
 
 function Get-PermissionsSummary {
@@ -1462,55 +1518,12 @@ function Get-ComputerServerInfo {
 function Get-ServerInventory {
 	Write-Host "Beginning server inventory"
 
-	Write-Host "This process requires a 'Servers' file in the same directory as the main script. If it's a CSV, it needs only a single column named 'fqdn' that contains the FQDN of each server to inventory. If it's a plain text file, it should contain one FQDN per line."
-
-	$inputFiles = Get-ChildItem -Path . -Filter "Servers*" -File
-	switch ($inputFiles.Count) {
-		0 {
-			Write-Log "No 'Servers' input file found in the current directory." -Level ERROR
-			Read-Host "Press [ENTER] to return to the menu."
-			return
-		}
-		1 {
-			$file = $inputFiles[0].Name
-			break;
-		}
-		default {
-			Write-Host "Select the 'Servers' input file to use:"
-			for ($i=1; $i -le $inputFiles.Count; $i++) {
-				Write-Host "$i. $($inputFiles[$i-1].Name)"
-			}
-			Write-Host "X. Cancel"
-			$selection = Read-Host "Enter the number corresponding to the 'Servers' input file to use, or 'X' to cancel"
-			if ($selection -match '^\d+$' -and $selection -ge 1 -and $selection -le $inputFiles.Count) {
-				$file = $inputFiles[$selection-1].Name
-				break;
-			} elseif ($selection -match '^[Xx]$') {
-				Write-Log "User canceled 'Servers' input file selection." -Level ERROR
-				Read-Host "Press [ENTER] to return to the menu."
-				return
-			} else {
-				Write-Log "Invalid selection for 'Servers' input file." -Level ERROR
-				Read-Host "Press [ENTER] to return to the menu."
-				return
-			}
-		}
+	$Servers = Get-InputObjects -FilePrefix "Servers"
+	if (-not $Servers) {
+		Read-Host "Press [ENTER] to return to the menu."
+		return
 	}
-	$file = Get-Item -Path $file
-	switch ($file.Extension.ToLower()) {
-		".csv" {
-			$Servers = Import-Csv -Path $file | Select-Object -ExpandProperty fqdn
-		}
-		".txt" {
-			$Servers = Get-Content -Path $file | Where-Object { $_ }
-		}
-		default {
-			Write-Log "Unsupported 'Servers' input file type: $file" -Level ERROR
-			Read-Host "Press [ENTER] to return to the menu."
-			return
-		}
-	}
-	Write-Log "Read $($Servers.Count) servers in $file"
+	Write-Log "Read $($Servers.Count) servers."
 
 	$resumeFile = ".\Server Inventory.resume"
 	$outputFile = "Server Inventory (Incomplete).csv"
@@ -1630,7 +1643,11 @@ function Get-ServerInventory {
 function Get-FileshareInventory {
 	Write-Host "Beginning file share inventory"
 
-	Read-Host "This process requires a 'Fileshares.csv' file in the same directory as the main script. The CSV needs only a single column named 'ShareUNC' that contains the UNC path of each share to inventory. Press [ENTER] to continue."
+	$Shares = Get-InputObjects -FilePrefix "Fileshares"
+	if (-not $Shares) {
+		Read-Host "Press [ENTER] to return to the menu."
+		return
+	}
 
 	$resumeFile = ".\File Share Inventory.resume"
 	$outputFile = "File Share Inventory (Incomplete).csv"
@@ -1649,16 +1666,6 @@ function Get-FileshareInventory {
 			Remove-Item $resumeFile -Force -ErrorAction SilentlyContinue
 			Remove-Item $outputFullPath -Force -ErrorAction SilentlyContinue
 		}
-	}
-
-	Write-Host "Reading list of shares from Fileshares.csv"
-	try {
-		$Shares = (Import-Csv -Path "Fileshares.csv" -ErrorAction Stop).ShareUNC
-		Write-Log "Read $($Shares.Count) shares in Fileshares.csv"
-	} catch {
-		Write-Log "Failed to load Fileshares.csv. The specific error is: $_" -Level ERROR
-		Read-Host "Press [ENTER] to return to the menu."
-		return
 	}
 
 	$report = [System.Collections.Generic.List[psobject]]::new()
