@@ -422,6 +422,8 @@ function Get-TraversedFolders {
  
 	$results = [System.Collections.Generic.List[psobject]]::new()
 	if ($Depth -gt $MaxTraversalDepth) { return $null }
+
+	Start-Sleep $Script:TraversalThrottle
  
 	$children = Get-ChildItem -Path $Path -Directory -ErrorAction SilentlyContinue
 	foreach ($child in $children) {
@@ -1655,6 +1657,7 @@ function Get-FileshareInventory {
 	$outputFullPath = $(if ($global:Settings["OutputInSubdirectory"]) { ".\OUTPUT\$outputFile" } else { $outputFile })
 
 	$Script:TraversedFolders = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+	$Script:TraveralThrottle = $Global:Variables["FileshareThrottleInSecs"] ?? 0
 
 	$MaxTraversalDepth = $Global:Variables["MaxTraversalDepth"] ?? 2
 
@@ -1682,8 +1685,8 @@ function Get-FileshareInventory {
 		if (-not $TraversedFolders.Contains($share)) {
 			Write-Log "Connecting to $share$($UserPassSplat ? " with credentials $($UserPassSplat.UserName)" : '')"
 			try {
-				Remove-SmbMapping -RemotePath $share -Force -ErrorAction SilentlyContinue
-				New-SmbMapping -RemotePath $share -Persistent $false @UserPassSplat
+				[void](Remove-SmbMapping -RemotePath $share -Force -ErrorAction SilentlyContinue)
+				[void](New-SmbMapping -RemotePath $share -Persistent $false @UserPassSplat)
 			} catch {
 				Write-Log "Failed to connect to $share`: $_" -Level ERROR
 				continue
@@ -1703,7 +1706,7 @@ function Get-FileshareInventory {
 				"Permissions" = $permissions;
 			})
 
-			Write-Log "Traversing subfolders of $share"
+			Write-Log "Traversing $MaxTraversalDepth levels of subfolders in $share"
 			$folderResults = Get-TraversedFolders -Path $share -Depth 1 -MaxTraversalDepth $MaxTraversalDepth -RelativeName "" -ShareName $share -ResumeFile $resumeFile
 			if ($folderResults -and $folderResults.Count -gt 0) {
 				$report.AddRange([psobject[]]$folderResults)
@@ -1715,7 +1718,7 @@ function Get-FileshareInventory {
 
 			Remove-SmbMapping -RemotePath $share -Force -ErrorAction SilentlyContinue
 		}
-		Start-Sleep -Seconds $Global:Variables["FileshareThrottleInSecs"]
+		Start-Sleep -Seconds $Script:TraveralThrottle
 	}
 
 	# Finalize: rename the in-progress file to the timestamped convention (Move-Item accepts a full path,
