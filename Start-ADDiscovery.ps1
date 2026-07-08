@@ -1516,7 +1516,7 @@ function Get-ComputerServerInfo {
 }
 
 function Get-ServerInventory {
-	Write-Host "Beginning server inventory"
+	Write-Title "Server Inventory"
 
 	$Servers = Get-InputFile -FilePrefix "Servers"
 	if (-not $Servers) {
@@ -1641,7 +1641,7 @@ function Get-ServerInventory {
 }
 
 function Get-FileshareInventory {
-	Write-Host "Beginning file share inventory"
+	Write-Title "File Share Inventory"
 
 	$Shares = Get-InputFile -FilePrefix "Fileshares"
 	if (-not $Shares) {
@@ -1681,10 +1681,17 @@ function Get-FileshareInventory {
 	foreach ($share in $Shares) {
 		if (-not $TraversedFolders.Contains($share)) {
 			Write-Log "Connecting to $share$($UserPassSplat ? " with credentials $($UserPassSplat.UserName)" : '')"
-			Remove-SmbMapping -RemotePath $share -Force -ErrorAction SilentlyContinue
-			New-SmbMapping -RemotePath $share -Persistent $false @UserPassSplat
-
+			try {
+				Remove-SmbMapping -RemotePath $share -Force -ErrorAction SilentlyContinue
+				New-SmbMapping -RemotePath $share -Persistent $false @UserPassSplat
+			} catch {
+				Write-Log "Failed to connect to $share`: $_" -Level ERROR
+				continue
+			}
+			Write-Log "Gathering size for $share"
 			$folderSize = Get-FolderSize -Path $share
+			Write-Log "Size for $share is $folderSize MB"
+			Write-Log "Gathering permissions for $share"
 			$permissions = Get-PermissionsSummary -Path $share
 
 			$report.Add([pscustomobject]@{
@@ -1696,6 +1703,7 @@ function Get-FileshareInventory {
 				"Permissions" = $permissions;
 			})
 
+			Write-Log "Traversing subfolders of $share"
 			$folderResults = Get-TraversedFolders -Path $share -Depth 1 -MaxTraversalDepth $MaxTraversalDepth -RelativeName "" -ShareName $share -ResumeFile $resumeFile
 			if ($folderResults -and $folderResults.Count -gt 0) {
 				$report.AddRange([psobject[]]$folderResults)
