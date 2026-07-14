@@ -1118,14 +1118,18 @@ function Get-UserGroupInfo {
 			"pwdLastSet" = "PasswordLastSet";
 			"msDS-User-Account-Control-Computed" = "LockedOut";
 		}
-		if ($Variables["UseADSISearcher"]) {
+		if ($global:Variables["UseADSISearcher"]) {
 			$UserAttributes += $AttribMap.Keys
 		} else {
 			$UserAttributes += $AttribMap.Values
 		}
 
-		if ($Variables["AdditionalUserAttributes"]) {
-			$UserAttributes += $Variables["AdditionalUserAttributes"]
+		if ($global:Variables["IncludeExchangeAttributes"]) {
+			$UserAttributes += "proxyAddresses","targetAddress","mailNickname","homeMdb","msExchRemoteRecipientType"
+		}
+
+		if ($global:Variables["AdditionalUserAttributes"]) {
+			$UserAttributes += $global:Variables["AdditionalUserAttributes"]
 		}
 
 		foreach ($domain in $script:Forest.Domains) {
@@ -1141,7 +1145,7 @@ function Get-UserGroupInfo {
 				}
 			}
 
-			if ($Variables["UseADSISearcher"]) {
+			if ($global:Variables["UseADSISearcher"]) {
 				# userAccountControl and msDS-User-Account-Control-Computed are bit fields, so the flags we
 				# report are decoded here rather than renamed. Bits: 0x2 = ACCOUNTDISABLE (Enabled is its
 				# inverse), 0x10000 = DONT_EXPIRE_PASSWORD, 0x10 (computed) = LOCKOUT.
@@ -1203,7 +1207,7 @@ function Get-UserGroupInfo {
 			"whenCreated" = "Created";
 			"whenChanged" = "Modified";
 		}
-		if ($Variables["UseADSISearcher"]) {
+		if ($global:Variables["UseADSISearcher"]) {
 			$GroupAttributes += $AttribMap.Keys
 			$GroupAttributes += "groupType" # bitfield decoded into GroupCategory + GroupScope below
 		} else {
@@ -1211,8 +1215,12 @@ function Get-UserGroupInfo {
 			$GroupAttributes += "GroupCategory","GroupScope"
 		}
 
-		if ($Variables["AdditionalGroupAttributes"]) {
-			$GroupAttributes += $Variables["AdditionalGroupAttributes"]
+		if ($global:Variables["IncludeExchangeAttributes"]) {
+			$GroupAttributes += "proxyAddresses","targetAddress"
+		}
+
+		if ($global:Variables["AdditionalGroupAttributes"]) {
+			$GroupAttributes += $global:Variables["AdditionalGroupAttributes"]
 		}
 
 		foreach ($domain in $script:Forest.Domains) {
@@ -1657,9 +1665,9 @@ function Get-FileshareInventory {
 	$outputFullPath = $(if ($global:Settings["OutputInSubdirectory"]) { ".\OUTPUT\$outputFile" } else { $outputFile })
 
 	$Script:TraversedFolders = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-	$Script:TraveralThrottle = $Global:Variables["FileshareThrottleInSecs"] ?? 0
+	$Script:TraveralThrottle = $global:Variables["FileshareThrottleInSecs"] ?? 0
 
-	$MaxTraversalDepth = $Global:Variables["MaxTraversalDepth"] ?? 2
+	$MaxTraversalDepth = $global:Variables["MaxTraversalDepth"] ?? 2
 
 	if (Test-Path $resumeFile) {
 		if (Get-Confirmation -Message "Unfinished inventory detected. Resume?" -DefaultToYes) {

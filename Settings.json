@@ -19,6 +19,7 @@
 	},
 	"variables" : {
 		"SourceDomain" : "",
+		"IncludeExchangeAttributes" : false, // If set to true, the discovery script will include Exchange attributes.
 		"SkipForestDiscovery" : true, // When set to true, the discovery script will only run against the singular domain specified by the SourceDomain (or the domain that is detected on the account running the script)
 		"AdditionalUserAttributes" : [], // If you enable the "UseADSISearcher" switch and want to include additional attributes, you must populate these variables with the exact ADSI attribute name, not their ADWS/PowerShell aliases
 		"AdditionalGroupAttributes" : [],
