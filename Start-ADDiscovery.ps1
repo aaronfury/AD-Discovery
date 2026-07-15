@@ -621,6 +621,29 @@ function Get-ForestDomainInfo {
 				Write-Log "- Found $(@($AllDomains).Count) domains in forest $($script:Forest.DnsRoot)."
 				Write-Log "- Found $($AllDomains.ReplicaDirectoryServers.Count) domain controllers in forest $($script:Forest.DnsRoot)."
 
+				Write-Log "- Checking AD Recycle Bin status..."
+				try {
+					$recycleBin = Get-ADOptionalFeature -Filter 'Name -eq "Recycle Bin Feature"' -Server $script:Forest.SchemaMaster @CredSplat
+					$script:Forest.RecycleBinEnabled = $null -ne $recycleBin.EnabledScopes
+				} catch {
+					Write-Log " - Unable to determine AD Recycle Bin status. The specific error is: $_" -Level ERROR
+				}
+
+				if ($script:Settings["AdminIsPrivileged"]) {
+					Write-Log "- Checking FRS/DFS-R status..."
+					try {
+						$dfsrStatus = Invoke-Command -ComputerName $script:Forest.SchemaMaster -ScriptBlock {dfsrmig /getglobalstate}
+						$script:Forest.DfsrStatus = switch ($true) {
+							($dfsrStatus[0] -like "*Eliminated*") { $script:Forest.DfsrStatus = "Migrated" }
+							($dfsrStatus[0] -like "*Start*") { $script:Forest.DfsrStatus = "DFS-R Not Enabled" }
+							($dfsrStatus[0] -like "*Prepared*" -or $dfsrStatus[0] -like "*Redirected*") { $script:Forest.DfsrStatus = "In-Progress" }
+						}
+					} catch {
+						Write-Log " - Unable to determine FRS/DFS-R status. The specific error is: $_" -Level ERROR
+					}
+				} else { $script:Forest.DfsrStatus = "Insufficient Privileges" }
+
+
 			# Forest Information - Functional Level, Alternative UPN suffixes, AD Sites and replication links, Global Catalogs, AD Recycle Bin, FRS/DFS-R Status
 			$script:ForestData = [ordered]@{
 				"Root Domain" = $script:Forest.RootDomain;
@@ -632,6 +655,8 @@ function Get-ForestDomainInfo {
 				"AD Site Count" = $script:Forest.Sites.Count;
 				"Schema Level" = $SchemaLevel;
 				"Alternative UPN Suffixes" = $script:Forest.UPNSuffixes -join ", "
+				"AD Recycle Bin Enabled" = $script:Forest.RecycleBinEnabled;
+				"DFS-R Status" = $script:Forest.DfsrStatus;
 			}
 
 			$script:ForestData | Write-Data -OutputFile "Forest Summary - $($Forest.RootDomain) - $global:ScriptExecutionTimestamp.csv"
