@@ -887,7 +887,8 @@ function Get-ForestDomainInfo {
 						"Owner" = $gpo.Owner;
 						"GUID" = $gpo.Id;
 						"Link Count" = $links.Count;
-						"Linked To" = $(if ($links.Count) { $links -join "; " } else { "(unlinked)" });
+						"Enabled Links" = $($links | Where-Object {$_ -like "Enabled:*"}).Count;
+						"Linked To" = $(if ($links.Count) { $links -join "; " -replace "\[.*?\]",'' } else { "(unlinked)" });
 						"WMI Filter" = $gpo.WmiFilter;
 					}
 				}
@@ -1153,6 +1154,10 @@ function Get-UserGroupInfo {
 			$UserAttributes += "proxyAddresses","targetAddress","mailNickname","homeMdb","msExchRemoteRecipientType"
 		}
 
+		if ($global:Variables["IncludeEntraAttributes"]) {
+			$UserAttributes += "msDS-ExternalDirectoryObjectId"
+		}
+
 		if ($global:Variables["AdditionalUserAttributes"]) {
 			$UserAttributes += $global:Variables["AdditionalUserAttributes"]
 		}
@@ -1242,6 +1247,10 @@ function Get-UserGroupInfo {
 
 		if ($global:Variables["IncludeExchangeAttributes"]) {
 			$GroupAttributes += "proxyAddresses","targetAddress"
+		}
+
+		if ($global:Variables["IncludeEntraAttributes"]) {
+			$GroupAttributes += "msDS-ExternalDirectoryObjectId"
 		}
 
 		if ($global:Variables["AdditionalGroupAttributes"]) {
